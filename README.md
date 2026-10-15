@@ -195,7 +195,7 @@ are in `LICENSE`.
 
 ## What binding FatFs found in sysl
 
-Found against sysl 0.1.0-alpha.12; none is worked around. All three are the gaps
+In full in `FINDINGS.md`. Found against sysl 0.1.0-alpha.12; none is worked around. All three are the gaps
 [`sysl-lang/littlefs`](https://github.com/sysl-lang/littlefs) found first (its FINDINGS 1–3), met
 again here. Binding FatFs found no new one: the `@export`ed disk layer, a table of
 `Option[*BlockDevice]` trait objects as folded module storage, `*u32` and `*u16` writes through
