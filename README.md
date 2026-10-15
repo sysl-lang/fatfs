@@ -3,6 +3,8 @@
 FAT12, FAT16 and FAT32 volumes with long UTF-8 names, bound to ChaN's
 [FatFs](http://elm-chan.org/fsw/ff/) R0.16 (with its two official patches), vendored unchanged.
 
+*An independent sysl package for FatFs. It is not affiliated with or endorsed by FatFs's authors or trademark holders.*
+
 - **It is what a PC reads.** An SD card, a USB stick or a disk image written here opens on Windows,
   macOS and Linux, and the tests check that against three independent tools.
 - **It needs no heap.** A volume's sector window and each open file's sector buffer are arrays inside
