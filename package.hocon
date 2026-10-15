@@ -1,0 +1,19 @@
+// FatFs for sysl: FAT12, FAT16 and FAT32 volumes with long UTF-8 names, bound to ChaN's FatFs
+// (elm-chan.org/fsw/ff), vendored unchanged.
+//
+// This is the block a consumer writes to reach it:
+//
+//     dependencies {
+//       fatfs { git = "github.com/sysl-lang/fatfs", version = "<the first tag>" }
+//     }
+//
+// The module is `sh.sysl.fatfs`.
+//
+// What FatFs is compiled with is in `sh/sysl/fatfs/c/ffconf.h`, which is FatFs's application
+// configuration file by design and this package's decision rather than a consumer's. The README lists
+// every setting changed from upstream's template and why.
+
+package {
+  name    = "fatfs"
+  version = "0.0.1"
+}

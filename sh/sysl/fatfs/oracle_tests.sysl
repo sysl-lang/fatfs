@@ -1,0 +1,241 @@
+module sh.sysl.fatfs
+@tests
+@requires(heap, os)
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{exists, make_temp_dir, read_bytes, remove_dir_all, write_bytes}
+import sysl.process.{Var, capture}
+import sysl.testing.skip
+import sysl.text.Search
+
+// The binding against three tools that know FAT independently of FatFs: macOS's fsck_msdos (from the
+// BSDs) and dosfstools' fsck.fat (Linux's) must find a volume FatFs formatted and filled clean, as FAT16
+// and as FAT32; mtools must read back every file and long name FatFs wrote; and FatFs must read every
+// file and long name mtools wrote into a volume dosfstools formatted.
+
+private val FSCK_MSDOS: string = "/sbin/fsck_msdos"
+private val FSCK_FAT: string = "/opt/homebrew/sbin/fsck.fat"
+private val MKFS_FAT: string = "/opt/homebrew/sbin/mkfs.fat"
+private val MCOPY: string = "/opt/homebrew/bin/mcopy"
+private val MDIR: string = "/opt/homebrew/bin/mdir"
+private val MMD: string = "/opt/homebrew/bin/mmd"
+
+private need(tools: []const string)
+    for tool in tools
+        if !exists(tool) then skip(f"$tool is not installed (brew install dosfstools mtools)")
+
+// mtools reads names from its arguments in the locale's character set, and checks a volume's
+// geometry against a disk's unless told not to.
+private mtool(tool: string, args: []const string) -> string
+    val env: []const Var = [Var("MTOOLS_SKIP_CHECK", "1"), Var("LC_ALL", "en_US.UTF-8")]
+    val r = capture(tool, args, env = env, stderr = true).unwrap()
+    if !r.status.ok()
+        val said = r.err.unwrap_or("")
+        panic(f"$tool failed: ${r.text}$said")
+    r.text
+
+private content(n: usize, seed: usize) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<n
+        out.push(u8((i * 13 + seed * 7 + i / 251) % 256))
+    out
+
+private bytes_equal(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+// A file to write: its name and size. Its bytes are `content(size, seed)`.
+private struct Sample
+    name: string
+    size: usize
+    seed: usize
+
+// No name past U+FFFF: mtools keeps only the low sixteen bits of such a character, so a surrogate
+// pair is tested in the package instead.
+private val SAMPLES: [9]Sample = [
+    Sample("empty", 0, 1),
+    Sample("a", 1, 2),
+    Sample("Long name with spaces.txt", 511, 3),
+    Sample("README.TXT", 512, 4),
+    Sample("lower.txt", 513, 5),
+    Sample("MiXeD.Txt", 100, 6),
+    Sample("naïve café.bin", 4096, 7),
+    Sample("日本語のファイル名.dat", 65537, 8),
+    Sample("Ελληνικά — μεγάλο αρχείο", 300000, 9),
+]
+
+private many_name(k: usize) -> string = f"file number $k with a long name.txt"
+
+// Fill a mounted volume with every sample in the root and in `/docs/deep/er`, sixty more files in
+// `/many`, a few removed and renamed, and a label.
+private fill(vol: *Volume)
+    vol.mkdir("docs").unwrap()
+    vol.mkdir("docs/deep").unwrap()
+    vol.mkdir("docs/deep/er").unwrap()
+    vol.mkdir("many").unwrap()
+    var f = file()
+    for s in SAMPLES
+        for at in ["", "docs/deep/er/"]
+            vol.open(&f, f"$at${s.name}", WRITE | CREATE_NEW).unwrap()
+            f.write_all(content(s.size, s.seed).view()).unwrap()
+            f.close().unwrap()
+    for k in 0usize..<60
+        vol.open(&f, f"many/${many_name(k)}", WRITE | CREATE_NEW).unwrap()
+        f.write_all(content(k * 97, k).view()).unwrap()
+        f.close().unwrap()
+    for k in 0usize..<60
+        if k % 7 == 3 then vol.remove(f"many/${many_name(k)}").unwrap()
+    vol.rename("many/file number 5 with a long name.txt", "docs/renamed from many.txt").unwrap()
+
+// Format a volume of `sectors` sectors as `kind`, fill it, and write its image to `image`.
+private filled_image(image: string, sectors: u32, kind: FatKind, want: FatType)
+    var dev = ram_device(512, sectors)
+    var vol = volume(0, &dev)
+    var work: [8192]u8 = [0; 8192]
+    vol.format(format_options(kind, partitioned = false, fats = 2), work[..]).unwrap()
+    vol.mount().unwrap()
+    assert_eq(vol.fat_type().unwrap(), want)
+    fill(&vol)
+    vol.unmount().unwrap()
+    write_bytes(image, dev.image()).unwrap()
+
+private fsck_clean(image: string)
+    val bsd = capture(FSCK_MSDOS, ["-n", image], stderr = true).unwrap()
+    val bsd_text = f"${bsd.text}${bsd.err.unwrap_or("")}"
+    if !bsd.status.ok() then panic(f"fsck_msdos rejected the volume:\n$bsd_text")
+    val linux = capture(FSCK_FAT, ["-n", "-v", image], stderr = true).unwrap()
+    val text = f"${linux.text}${linux.err.unwrap_or("")}"
+    if !linux.status.ok() then panic(f"fsck.fat rejected the volume:\n$text")
+    // fsck.fat -n reports what it would change on stdout and still exits 0 for some of it.
+    assert(!text.contains("Free cluster summary wrong"), text)
+    assert(!text.contains("Fix?"), text)
+
+// Every sample, read back through mtools, is the bytes FatFs wrote, under the name FatFs gave it.
+private mtools_reads(dir: string, image: string)
+    for s in SAMPLES
+        for at in ["::/", "::/docs/deep/er/"]
+            val out = f"$dir/out-${s.seed}"
+            mtool(MCOPY, ["-n", "-i", image, f"$at${s.name}", out])
+            assert(bytes_equal(read_bytes(out).unwrap(), content(s.size, s.seed).view()), f"$at${s.name}")
+    // `mdir -b` lists one path a line, under its long name where it has one.
+    val listed = mtool(MDIR, ["-b", "-i", image, "::/docs/deep/er"])
+    for s in SAMPLES
+        assert(listed.contains(f"::/docs/deep/er/${s.name}\n"), f"mdir did not list ${s.name}:\n$listed")
+    val many = mtool(MDIR, ["-b", "-i", image, "::/many"])
+    for k in 0usize..<60
+        val present = many.contains(f"::/many/${many_name(k)}\n")
+        assert_eq(present, k % 7 != 3 && k != 5)
+    val out = f"$dir/renamed"
+    mtool(MCOPY, ["-n", "-i", image, "::/docs/renamed from many.txt", out])
+    assert(bytes_equal(read_bytes(out).unwrap(), content(5 * 97, 5).view()))
+
+// FatFs's `f_setlabel` writes the label into the root directory, where mtools and Windows read it,
+// and leaves the copy in the boot sector as formatted ("NO NAME"). fsck.fat calls that a difference
+// worth fixing, so the label is checked on a volume of its own.
+@test("mtools reads the label FatFs set; fsck.fat notes FatFs left the boot sector's copy alone")
+label_against_the_tools()
+    need([FSCK_FAT, MDIR])
+    val dir = make_temp_dir("fatfs-oracle-").unwrap()
+    val image = f"$dir/label.img"
+    var dev = ram_device(512, 8192)
+    var vol = volume(0, &dev)
+    var work: [4096]u8 = [0; 4096]
+    vol.format(format_options(partitioned = false), work[..]).unwrap()
+    vol.mount().unwrap()
+    vol.set_label("FATFS SYSL").unwrap()
+    vol.unmount().unwrap()
+    write_bytes(image, dev.image()).unwrap()
+    val root = mtool(MDIR, ["-i", image, "::/"])
+    assert(root.contains("Volume in drive : is FATFS SYSL"), root)
+    val linux = capture(FSCK_FAT, ["-n", "-v", image], stderr = true).unwrap()
+    assert(linux.text.contains("There is no label in boot sector, but there is volume label 'FATFS SYSL' stored in root directory"), linux.text)
+    remove_dir_all(dir).unwrap()
+
+@test("fsck_msdos and fsck.fat find a FAT16 volume FatFs formatted and filled clean, and mtools reads it all back")
+fat16_against_the_tools()
+    need([FSCK_MSDOS, FSCK_FAT, MCOPY, MDIR])
+    val dir = make_temp_dir("fatfs-oracle-").unwrap()
+    val image = f"$dir/fat16.img"
+    filled_image(image, 40_000, FatKind.Fat, FatType.Fat16)
+    fsck_clean(image)
+    mtools_reads(dir, image)
+    remove_dir_all(dir).unwrap()
+
+@test("fsck_msdos and fsck.fat find a FAT32 volume FatFs formatted and filled clean, and mtools reads it all back")
+fat32_against_the_tools()
+    need([FSCK_MSDOS, FSCK_FAT, MCOPY, MDIR])
+    val dir = make_temp_dir("fatfs-oracle-").unwrap()
+    val image = f"$dir/fat32.img"
+    filled_image(image, 70_000, FatKind.Fat32, FatType.Fat32)
+    fsck_clean(image)
+    mtools_reads(dir, image)
+    remove_dir_all(dir).unwrap()
+
+// A volume dosfstools formatted and mtools filled, mounted by FatFs: every sample reads back byte for
+// byte, every directory lists exactly the names mtools was given, and FatFs's own writes to it leave
+// it clean.
+private reads_what_mtools_wrote(fat_bits: string, kib: string, want: FatType)
+    need([MKFS_FAT, MCOPY, MMD, FSCK_FAT])
+    val scratch = make_temp_dir("fatfs-oracle-").unwrap()
+    val image = f"$scratch/theirs.img"
+    val made = capture(MKFS_FAT, ["-F", fat_bits, "-s", "1", "-n", "MTOOLS", "-C", image, kib], stderr = true).unwrap()
+    assert(made.status.ok(), f"mkfs.fat failed: ${made.text}")
+    mtool(MMD, ["-i", image, "::/docs", "::/docs/deep"])
+    for s in SAMPLES
+        val local = f"$scratch/src-${s.seed}"
+        write_bytes(local, content(s.size, s.seed).view()).unwrap()
+        mtool(MCOPY, ["-i", image, local, f"::/${s.name}"])
+        mtool(MCOPY, ["-i", image, local, f"::/docs/deep/${s.name}"])
+    val theirs = read_bytes(image).unwrap()
+    var dev = ram_device(512, u32(theirs.len / 512))
+    dev.load(theirs).unwrap()
+    var vol = volume(0, &dev)
+    vol.mount().unwrap()
+    assert_eq(vol.fat_type().unwrap(), want)
+    var l = vol.label().unwrap()
+    assert_eq(l.name(), "MTOOLS")
+    var f = file()
+    for s in SAMPLES
+        for at in ["", "docs/deep/"]
+            vol.open(&f, f"$at${s.name}", READ).unwrap()
+            assert_eq(usize(f.size()), s.size)
+            var got: Buf[u8] = buf()
+            for _ in 0..<s.size
+                got.push(0)
+            assert_eq(f.read(got.view()).unwrap(), s.size)
+            f.close().unwrap()
+            assert(bytes_equal(got.view(), content(s.size, s.seed).view()), f"$at${s.name}")
+    var d = dir()
+    vol.open_dir(&d, "docs/deep").unwrap()
+    var e = info()
+    var listed = ""
+    while d.read(&e).unwrap()
+        listed = f"$listed|${e.name()}"
+    d.close().unwrap()
+    var want = ""
+    for s in SAMPLES
+        want = f"$want|${s.name}"
+    assert_eq(listed, want)
+    // FatFs writes into mtools's volume, and both fsck tools still find it clean.
+    vol.open(&f, "docs/from fatfs — ünïcode.txt", WRITE | CREATE_NEW).unwrap()
+    f.write_all(content(10_000, 42).view()).unwrap()
+    f.close().unwrap()
+    vol.remove("docs/deep/a").unwrap()
+    vol.unmount().unwrap()
+    write_bytes(image, dev.image()).unwrap()
+    val linux = capture(FSCK_FAT, ["-n", "-v", image], stderr = true).unwrap()
+    assert(linux.status.ok(), f"fsck.fat rejected the volume after FatFs wrote to it:\n${linux.text}")
+    val out = f"$scratch/back"
+    mtool(MCOPY, ["-n", "-i", image, "::/docs/from fatfs — ünïcode.txt", out])
+    assert(bytes_equal(read_bytes(out).unwrap(), content(10_000, 42).view()))
+    remove_dir_all(scratch).unwrap()
+
+@test("FatFs reads every file and long name mtools wrote into a FAT16 volume dosfstools formatted")
+reads_mtools_fat16()
+    reads_what_mtools_wrote("16", "20480", FatType.Fat16)
+
+@test("FatFs reads every file and long name mtools wrote into a FAT32 volume dosfstools formatted")
+reads_mtools_fat32()
+    reads_what_mtools_wrote("32", "65536", FatType.Fat32)

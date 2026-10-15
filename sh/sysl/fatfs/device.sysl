@@ -1,0 +1,46 @@
+module sh.sysl.fatfs
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.copy
+
+// A disk in memory, for tests and RAM disks. Unlike the rest of the package it allocates: its sectors
+// are one `Buf`.
+struct RamDevice
+    private bytes: Buf[u8]
+    private sector_bytes: u32
+    private sectors: u32
+
+    // Every byte the device holds, for a test that looks at the raw image or writes it to a file.
+    image(self) -> []const u8 = self.bytes.view()
+
+    // Replace the device's contents with `image`, which must be its size.
+    load(*self, image: []const u8) -> Result[unit, DeviceError]
+        if image.len != self.bytes.len() then return Err(DeviceError.Io)
+        copy(self.bytes.view(), image)
+        Ok(())
+
+// A zeroed device of `sectors` sectors of `sector_size` bytes.
+ram_device(sector_size: u32, sectors: u32) -> RamDevice
+    var bytes: Buf[u8] = buf()
+    for _ in 0..<usize(sector_size) * usize(sectors)
+        bytes.push(0)
+    RamDevice(bytes, sector_size, sectors)
+
+impl BlockDevice for RamDevice
+    sector_size(*self) -> u32 = self.sector_bytes
+
+    sector_count(*self) -> u32 = self.sectors
+
+    read(*self, sector: u32, out: []u8) -> Result[unit, DeviceError]
+        val at = usize(sector) * usize(self.sector_bytes)
+        if at + out.len > self.bytes.len() then return Err(DeviceError.Io)
+        copy(out, self.bytes.view()[at..<at + out.len])
+        Ok(())
+
+    write(*self, sector: u32, data: []const u8) -> Result[unit, DeviceError]
+        val at = usize(sector) * usize(self.sector_bytes)
+        if at + data.len > self.bytes.len() then return Err(DeviceError.Io)
+        copy(self.bytes.view()[at..<at + data.len], data)
+        Ok(())
+
+    sync(*self) -> Result[unit, DeviceError] = Ok(())

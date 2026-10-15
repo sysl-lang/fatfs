@@ -1,0 +1,477 @@
+module sh.sysl.fatfs
+
+import sh.sysl.fatfs.c
+import sysl.slices.{as_mut_ptr, as_ptr}
+import sysl.text.str_view
+
+// FAT12, FAT16 and FAT32 volumes, bound to ChaN's FatFs: what an SD card, a USB stick or a disk image
+// that a PC also reads is formatted with. Names are long and UTF-8.
+//
+// Nothing here allocates. A volume's sector window and each open file's sector buffer are arrays
+// inside the sysl values that own them, so a board with no heap declares them as module storage.
+//
+// **A mounted volume, an open file and an open directory must stay where they are.** FatFs keeps
+// their addresses: it registers a mounted volume by address, and every open file and directory
+// points at its volume. So each is reached through a pointer once it is in use (`*Volume`, `*File`,
+// `*Dir`), and a copy of one taken after `mount` or `open` is a copy FatFs knows nothing about.
+
+// Why an operation failed. The first nineteen are FatFs's own `FRESULT` codes.
+enum Error derives Eq, Display
+    // The device failed a read, a write or a sync (`FR_DISK_ERR`).
+    Disk
+    // FatFs found its own state inconsistent (`FR_INT_ERR`).
+    Internal
+    // The device could not be initialized (`FR_NOT_READY`).
+    NotReady
+    // No file is at the path (`FR_NO_FILE`).
+    NoFile
+    // A directory on the way to the path does not exist (`FR_NO_PATH`).
+    NoPath
+    // The path is not a valid FAT name (`FR_INVALID_NAME`).
+    InvalidName
+    // The entry may not be changed this way: a read-only file or one not opened for writing, a
+    // directory that is not empty, or a full directory or volume (`FR_DENIED`).
+    Denied
+    // Something is already at the path (`FR_EXIST`).
+    Exists
+    // The file or directory is not open (`FR_INVALID_OBJECT`).
+    InvalidObject
+    // The device refuses writes (`FR_WRITE_PROTECTED`).
+    WriteProtected
+    // There is no such drive (`FR_INVALID_DRIVE`).
+    InvalidDrive
+    // The volume is not mounted (`FR_NOT_ENABLED`).
+    NotEnabled
+    // The device holds no FAT volume (`FR_NO_FILESYSTEM`).
+    NoFilesystem
+    // `format` could not lay a volume out on this device with these options (`FR_MKFS_ABORTED`).
+    FormatAborted
+    // FatFs could not take the volume in time (`FR_TIMEOUT`).
+    Timeout
+    // The file is open already, and FatFs refuses a second open that writes, or a remove or rename of
+    // an open entry (`FR_LOCKED`).
+    Locked
+    // A buffer was too small: the work area handed to `format` (`FR_NOT_ENOUGH_CORE`).
+    NotEnoughCore
+    // More files are open than FatFs was configured to track (`FR_TOO_MANY_OPEN_FILES`).
+    TooManyOpenFiles
+    // An argument was out of range (`FR_INVALID_PARAMETER`).
+    InvalidParameter
+
+    // A write stopped short because the volume is full.
+    Full
+    // A path longer than `MAX_PATH` bytes, which is the room the binding keeps to hand FatFs a
+    // NUL-terminated copy.
+    PathTooLong
+    // Another volume's device already holds this drive.
+    DriveTaken
+    // A code this binding does not know, from a FatFs newer than the one it was written against.
+    Unknown(code: int)
+
+// The longest path a volume accepts, in bytes, not counting the drive number the binding puts in
+// front of it.
+const MAX_PATH: usize = 511
+
+// The smallest work area `format` takes, in bytes: the largest sector this configuration of FatFs
+// supports, as `f_mkfs` documents.
+const WORK_MIN: usize = usize(c.MAX_SS)
+
+// How many volumes may be mounted at once: drives 0 to `VOLUMES - 1`.
+const VOLUMES: usize = c.VOLUMES
+
+// How a file is opened: `READ`, `WRITE` or both, with at most one of the others. With none of them
+// the file must exist.
+const READ: u8 = c.FA_READ
+const WRITE: u8 = c.FA_WRITE
+// Create the file; fail with `Error.Exists` if it is there.
+const CREATE_NEW: u8 = c.FA_CREATE_NEW
+// Create the file, emptying it if it is there.
+const CREATE_ALWAYS: u8 = c.FA_CREATE_ALWAYS
+// Open the file, creating it if it is not there.
+const OPEN_ALWAYS: u8 = c.FA_OPEN_ALWAYS
+// As `OPEN_ALWAYS`, starting at the end.
+const OPEN_APPEND: u8 = c.FA_OPEN_APPEND
+
+// The attribute bits of an entry.
+const READ_ONLY: u8 = c.AM_RDO
+const HIDDEN: u8 = c.AM_HID
+const SYSTEM: u8 = c.AM_SYS
+const DIRECTORY: u8 = c.AM_DIR
+const ARCHIVE: u8 = c.AM_ARC
+
+// Room for a path: the drive number and its colon, the path, and a NUL.
+private const PATH_ROOM: usize = MAX_PATH + 3
+
+private[fatfs] const FATFS_WORDS: usize = (c.FATFS_SIZE + 7) / 8
+private[fatfs] const FIL_WORDS: usize = (c.FIL_SIZE + 7) / 8
+private[fatfs] const DIR_WORDS: usize = (c.DIR_SIZE + 7) / 8
+
+// Which FAT a volume is.
+enum FatType derives Display
+    Fat12
+    Fat16
+    Fat32
+
+// Which FAT `format` may write. `Fat` is FAT12 or FAT16, whichever the size calls for.
+enum FatKind derives Display
+    Fat
+    Fat32
+    Any
+
+// How `format` lays a volume out. A zero leaves the choice to FatFs.
+struct FormatOptions
+    kind: FatKind
+    // Whether to write a partition table with one partition (as an SD card has), or the volume
+    // straight from sector 0 (as a floppy has, and as most disk images do).
+    partitioned: bool
+    // One or two copies of the FAT; 0 is one.
+    fats: u8
+    // Align the data area to this many sectors; 0 takes the device's `erase_block`.
+    align: u32
+    // Root directory entries on FAT12 and FAT16; 0 is 512.
+    root_entries: u32
+    // Bytes in a cluster, a power of two; 0 picks one by the volume's size.
+    cluster_bytes: u32
+
+// Options for `format`, every one defaulted.
+format_options(kind: FatKind = FatKind.Any, partitioned: bool = true, fats: u8 = 0, align: u32 = 0,
+               root_entries: u32 = 0, cluster_bytes: u32 = 0) -> FormatOptions
+    FormatOptions(kind, partitioned, fats, align, root_entries, cluster_bytes)
+
+// One entry of a directory, or what `stat` found.
+//
+// **Its names are views of its own storage, not copies**, so nothing is allocated to list a directory;
+// a name read before the next `Dir.read` into the same `Info` changes with it. Copy one to keep it
+// (`from_utf8_unchecked(e.name().bytes)`).
+struct Info
+    private[fatfs] raw: c.FilInfo
+
+    // The entry's name, without its directory.
+    name(*self) -> string = terminated_view(self.raw.fname[..])
+
+    // Its 8.3 name, as DOS sees it.
+    short_name(*self) -> string = terminated_view(self.raw.altname[..])
+
+    // Its size in bytes; 0 for a directory.
+    size(self) -> u32 = self.raw.fsize
+
+    // Its attribute bits: `READ_ONLY`, `HIDDEN`, `SYSTEM`, `DIRECTORY`, `ARCHIVE`.
+    attributes(self) -> u8 = self.raw.fattrib
+
+    is_dir(self) -> bool = self.raw.fattrib & DIRECTORY != 0
+
+    // When it was last written, or for a directory when it was made.
+    modified(self) -> Timestamp = unpack_time(self.raw.fdate, self.raw.ftime)
+
+// An empty `Info`, for `stat` and `Dir.read` to fill.
+info() -> Info = Info(c.FilInfo(0, 0, 0, 0, [0; 35], [0; 766]))
+
+// What a volume holds and has free.
+struct Space
+    free_clusters: u32
+    total_clusters: u32
+    cluster_bytes: u32
+
+    free_bytes(self) -> u64 = u64(self.free_clusters) * u64(self.cluster_bytes)
+
+    total_bytes(self) -> u64 = u64(self.total_clusters) * u64(self.cluster_bytes)
+
+// A volume's label and serial number.
+struct Label
+    private bytes: [35]u8
+    serial: u32
+
+    // The label, or empty when the volume has none.
+    name(*self) -> string = terminated_view(self.bytes[..])
+
+// An open file. It is opened by `Volume.open` and keeps a pointer to its volume.
+struct File
+    private state: [FIL_WORDS]u64
+
+    // Read into `out` from where the file is, answering how many bytes came: fewer than asked only
+    // at the end of the file.
+    read(*self, out: []u8) -> Result[usize, Error]
+        var n = 0u32
+        check(c.f_read(self.fil(), as_mut_ptr(out), u32(out.len), &n))?
+        Ok(usize(n))
+
+    // Write `data` where the file is, answering how many bytes went: fewer than given only when the
+    // volume is full.
+    write(*self, data: []const u8) -> Result[usize, Error]
+        var n = 0u32
+        check(c.f_write(self.fil(), as_ptr(data), u32(data.len), &n))?
+        Ok(usize(n))
+
+    // Write all of `data`, or answer `Error.Full`.
+    write_all(*self, data: []const u8) -> Result[unit, Error]
+        if self.write(data)? < data.len then Err(Error.Full) else Ok(())
+
+    // Move to `offset` bytes from the start. Past the end of a file opened for writing, the file
+    // grows to reach it (its new bytes are whatever the clusters held); opened only for reading, the
+    // position stops at the end.
+    seek(*self, offset: u32) -> Result[unit, Error] = check(c.f_lseek(self.fil(), offset))
+
+    // Where the file is.
+    tell(*self) -> u32 = self.field(c.FIL_FPTR)
+
+    // How long it is.
+    size(*self) -> u32 = self.field(c.FIL_OBJSIZE)
+
+    // Whether it is at its end.
+    at_end(*self) -> bool = self.tell() == self.size()
+
+    // Whether it is open.
+    is_open(*self) -> bool
+        val fs: **u8 = ptr_cast(&self.bytes()[c.FIL_FS])
+        *fs != null
+
+    // Cut the file off where it is.
+    truncate(*self) -> Result[unit, Error] = check(c.f_truncate(self.fil()))
+
+    // Write what is buffered, keeping the file open.
+    sync(*self) -> Result[unit, Error] = check(c.f_sync(self.fil()))
+
+    // Write what is buffered and close the file.
+    close(*self) -> Result[unit, Error] = check(c.f_close(self.fil()))
+
+    private fil(*self) -> *c.Fil = ptr_cast(&self.state[0])
+
+    private bytes(*self) -> *u8 = ptr_cast(&self.state[0])
+
+    private field(*self, offset: usize) -> u32
+        val p: *u32 = ptr_cast(&self.bytes()[offset])
+        *p
+
+// A file that is not open yet.
+file() -> File = File([0; FIL_WORDS])
+
+// An open directory, read one entry at a time.
+struct Dir
+    private state: [DIR_WORDS]u64
+
+    // Fill `out` with the next entry, answering false at the end.
+    read(*self, out: *Info) -> Result[bool, Error]
+        check(c.f_readdir(self.dir(), &out.raw))?
+        Ok(out.raw.fname[0] != 0)
+
+    // Start over from the first entry.
+    rewind(*self) -> Result[unit, Error] = check(c.f_readdir(self.dir(), null))
+
+    close(*self) -> Result[unit, Error] = check(c.f_closedir(self.dir()))
+
+    private dir(*self) -> *c.Dir = ptr_cast(&self.state[0])
+
+// A directory that is not open yet.
+dir() -> Dir = Dir([0; DIR_WORDS])
+
+// A FAT volume on drive `drive` (0 to `VOLUMES - 1`) of the device it was made with. Paths name
+// entries on this volume, from its root: `"docs/a.txt"` or `"/docs/a.txt"`.
+struct Volume
+    private state: [FATFS_WORDS]u64
+    private path: [PATH_ROOM]u8
+    private second_path: [PATH_ROOM]u8
+    private device: *BlockDevice
+    private drive: u8
+    private mounted: bool
+
+    // Write an empty FAT volume over the device, using `work` as scratch: at least `WORK_MIN` bytes,
+    // and more makes it faster. The volume must not be mounted.
+    format(*self, options: FormatOptions, work: []u8) -> Result[unit, Error]
+        if self.mounted then return Err(Error.Denied)
+        // FatFs checks only for one sector of the device's size, then clears `FF_MAX_SS` bytes of the
+        // buffer when it writes a partition table.
+        if work.len < WORK_MIN then return Err(Error.NotEnoughCore)
+        val fmt = options.kind match
+            FatKind.Fat -> c.FM_FAT
+            FatKind.Fat32 -> c.FM_FAT32
+            FatKind.Any -> c.FM_ANY
+        var parm = c.MkfsParm(if options.partitioned then fmt else fmt | c.FM_SFD, options.fats, options.align,
+                              options.root_entries, options.cluster_bytes)
+        claim(self.drive, self.device)?
+        val p = self.root()
+        val r = check(c.f_mkfs(p, &parm, as_mut_ptr(work), u32(work.len)))
+        release(self.drive)
+        r
+
+    // Mount the volume already on the device.
+    mount(*self) -> Result[unit, Error]
+        if self.mounted then return Err(Error.Denied)
+        claim(self.drive, self.device)?
+        val p = self.root()
+        val r = check(c.f_mount(self.fatfs(), p, 1))
+        if r.is_err() then
+            c.f_mount(null, p, 0)
+            release(self.drive)
+            return r
+        self.mounted = true
+        Ok(())
+
+    // Unmount it. Files still open are not written: close them first.
+    unmount(*self) -> Result[unit, Error]
+        if !self.mounted then return Err(Error.NotEnabled)
+        val r = check(c.f_mount(null, self.root(), 0))
+        self.mounted = false
+        release(self.drive)
+        r
+
+    is_mounted(self) -> bool = self.mounted
+
+    // Which FAT the mounted volume is.
+    fat_type(*self) -> Result[FatType, Error]
+        self.live()?
+        val t = self.bytes()[c.FATFS_FS_TYPE]
+        if t == c.FS_FAT12 then Ok(FatType.Fat12)
+        else if t == c.FS_FAT16 then Ok(FatType.Fat16)
+        else if t == c.FS_FAT32 then Ok(FatType.Fat32)
+        else Err(Error.Internal)
+
+    // Bytes in a sector of the mounted volume.
+    sector_size(*self) -> Result[u32, Error]
+        self.live()?
+        Ok(u32(self.half(c.FATFS_SSIZE)))
+
+    // What the volume holds and has free. On FAT32 the first call after mounting may read the whole
+    // FAT to count.
+    free_space(*self) -> Result[Space, Error]
+        self.live()?
+        val p = self.root()
+        var free = 0u32
+        var fs: *c.Fatfs = null
+        check(c.f_getfree(p, &free, &fs))?
+        val total = self.word(c.FATFS_N_FATENT) - 2
+        Ok(Space(free, total, u32(self.half(c.FATFS_CSIZE)) * u32(self.half(c.FATFS_SSIZE))))
+
+    // The volume's label and serial number.
+    label(*self) -> Result[Label, Error]
+        self.live()?
+        val p = self.root()
+        var out = Label([0; 35], 0)
+        check(c.f_getlabel(p, &out.bytes[0], &out.serial))?
+        Ok(out)
+
+    // Set the label (up to 11 characters, of those FAT allows in a short name), or remove it with
+    // an empty string.
+    set_label(*self, label: string) -> Result[unit, Error]
+        val p = self.first(label)?
+        check(c.f_setlabel(p))
+
+    // Make a directory.
+    mkdir(*self, path: string) -> Result[unit, Error]
+        val p = self.first(path)?
+        check(c.f_mkdir(p))
+
+    // Remove a file, or a directory that is empty.
+    remove(*self, path: string) -> Result[unit, Error]
+        val p = self.first(path)?
+        check(c.f_unlink(p))
+
+    // Rename or move an entry. Nothing may be at `to`.
+    rename(*self, from: string, to: string) -> Result[unit, Error]
+        val a = self.first(from)?
+        val b = self.second(to)?
+        check(c.f_rename(a, b))
+
+    // What is at `path`.
+    stat(*self, path: string) -> Result[Info, Error]
+        val p = self.first(path)?
+        var out = info()
+        check(c.f_stat(p, &out.raw))?
+        Ok(out)
+
+    // Whether anything is at `path`.
+    exists(*self, path: string) -> Result[bool, Error]
+        self.stat(path) match
+            Ok(_) -> Ok(true)
+            Err(Error.NoFile) -> Ok(false)
+            Err(e) -> Err(e)
+
+    // Open the file at `path` into `f`, with `mode` (`READ` and `WRITE`, with any one of
+    // `CREATE_NEW`, `CREATE_ALWAYS`, `OPEN_ALWAYS`, `OPEN_APPEND`). `f` stays where it is until it is
+    // closed.
+    open(*self, f: *File, path: string, mode: u8) -> Result[unit, Error]
+        val p = self.first(path)?
+        check(c.f_open(f.fil(), p, mode))
+
+    // Open the directory at `path` into `d`. `d` stays where it is until it is closed.
+    open_dir(*self, d: *Dir, path: string) -> Result[unit, Error]
+        val p = self.first(path)?
+        check(c.f_opendir(d.dir(), p))
+
+    private fatfs(*self) -> *c.Fatfs = ptr_cast(&self.state[0])
+
+    private bytes(*self) -> *u8 = ptr_cast(&self.state[0])
+
+    private half(*self, offset: usize) -> u16
+        val p: *u16 = ptr_cast(&self.bytes()[offset])
+        *p
+
+    private word(*self, offset: usize) -> u32
+        val p: *u32 = ptr_cast(&self.bytes()[offset])
+        *p
+
+    private live(*self) -> Result[unit, Error] = if self.mounted then Ok(()) else Err(Error.NotEnabled)
+
+    // The drive alone (`"0:"`), naming the volume.
+    private root(*self) -> *u8
+        self.path[0] = u8('0') + self.drive
+        self.path[1] = u8(':')
+        self.path[2] = 0
+        &self.path[0]
+
+    // `path` on this volume, for an operation that needs it mounted.
+    private first(*self, path: string) -> Result[*u8, Error]
+        self.live()?
+        on_drive(self.drive, path, self.path[..])
+
+    private second(*self, path: string) -> Result[*u8, Error]
+        self.live()?
+        on_drive(self.drive, path, self.second_path[..])
+end Volume
+
+// A volume on drive `drive` of `device`, not yet formatted or mounted. It may be moved until it is
+// mounted.
+volume(drive: u8, device: *BlockDevice) -> Volume
+    Volume([0; FATFS_WORDS], [0; PATH_ROOM], [0; PATH_ROOM], device, drive, false)
+
+// `path` copied into `into` behind its drive number, with a NUL after it, for FatFs.
+private on_drive(drive: u8, path: string, into: []u8) -> Result[*u8, Error]
+    if path.len > MAX_PATH then return Err(Error.PathTooLong)
+    into[0] = u8('0') + drive
+    into[1] = u8(':')
+    for i in 0..<path.len
+        if path[i] == 0 then return Err(Error.InvalidName)
+        into[i + 2] = path[i]
+    into[path.len + 2] = 0
+    Ok(&into[0])
+
+// The NUL-terminated name at the start of `bytes`, without copying it.
+private terminated_view(bytes: []u8) -> string
+    var n = 0usize
+    while n < bytes.len && bytes[n] != 0
+        n += 1
+    str_view(bytes[0..<n])
+
+private[fatfs] check(code: int) -> Result[unit, Error] = if code == c.FR_OK then Ok(()) else Err(error(code))
+
+// The error an `FRESULT` code stands for.
+private[fatfs] error(code: int) -> Error
+    if code == c.FR_DISK_ERR then Error.Disk
+    else if code == c.FR_INT_ERR then Error.Internal
+    else if code == c.FR_NOT_READY then Error.NotReady
+    else if code == c.FR_NO_FILE then Error.NoFile
+    else if code == c.FR_NO_PATH then Error.NoPath
+    else if code == c.FR_INVALID_NAME then Error.InvalidName
+    else if code == c.FR_DENIED then Error.Denied
+    else if code == c.FR_EXIST then Error.Exists
+    else if code == c.FR_INVALID_OBJECT then Error.InvalidObject
+    else if code == c.FR_WRITE_PROTECTED then Error.WriteProtected
+    else if code == c.FR_INVALID_DRIVE then Error.InvalidDrive
+    else if code == c.FR_NOT_ENABLED then Error.NotEnabled
+    else if code == c.FR_NO_FILESYSTEM then Error.NoFilesystem
+    else if code == c.FR_MKFS_ABORTED then Error.FormatAborted
+    else if code == c.FR_TIMEOUT then Error.Timeout
+    else if code == c.FR_LOCKED then Error.Locked
+    else if code == c.FR_NOT_ENOUGH_CORE then Error.NotEnoughCore
+    else if code == c.FR_TOO_MANY_OPEN_FILES then Error.TooManyOpenFiles
+    else if code == c.FR_INVALID_PARAMETER then Error.InvalidParameter
+    else Error.Unknown(code)

@@ -1,0 +1,235 @@
+// FatFs as C declares it.
+//
+// **Everything that is C lives in this directory**: `ff.c`, `ff.h`, `diskio.h` and `ffunicode.c` as
+// they come from upstream, `ffconf.h` (FatFs's application configuration file, which is this
+// package's), and this file of declarations over them. Nothing here is meant to be called by a
+// program. Every path is a NUL-terminated `*u8` that starts with its drive number (`"0:/docs"`), every
+// answer is an `FRESULT` code, and every handle is storage whose address FatFs keeps. The module above
+// turns those into strings, `Result`s and methods, and is what an application imports.
+//
+// Each declaration below was read out of `ff.h` and `diskio.h`. A signature that disagrees with the
+// header links and then corrupts the call, so the layouts sysl declares itself (`FilInfo`,
+// `MkfsParm`) are checked field by field against the header's own `offsetof` when the package is
+// compiled.
+
+module sh.sysl.fatfs.c
+
+@include("ff.h")
+@include("diskio.h")
+@include("stddef.h")
+
+// What every function answers.
+c const
+    FR_OK:                  int = "FR_OK"
+    FR_DISK_ERR:            int = "FR_DISK_ERR"
+    FR_INT_ERR:             int = "FR_INT_ERR"
+    FR_NOT_READY:           int = "FR_NOT_READY"
+    FR_NO_FILE:             int = "FR_NO_FILE"
+    FR_NO_PATH:             int = "FR_NO_PATH"
+    FR_INVALID_NAME:        int = "FR_INVALID_NAME"
+    FR_DENIED:              int = "FR_DENIED"
+    FR_EXIST:               int = "FR_EXIST"
+    FR_INVALID_OBJECT:      int = "FR_INVALID_OBJECT"
+    FR_WRITE_PROTECTED:     int = "FR_WRITE_PROTECTED"
+    FR_INVALID_DRIVE:       int = "FR_INVALID_DRIVE"
+    FR_NOT_ENABLED:         int = "FR_NOT_ENABLED"
+    FR_NO_FILESYSTEM:       int = "FR_NO_FILESYSTEM"
+    FR_MKFS_ABORTED:        int = "FR_MKFS_ABORTED"
+    FR_TIMEOUT:             int = "FR_TIMEOUT"
+    FR_LOCKED:              int = "FR_LOCKED"
+    FR_NOT_ENOUGH_CORE:     int = "FR_NOT_ENOUGH_CORE"
+    FR_TOO_MANY_OPEN_FILES: int = "FR_TOO_MANY_OPEN_FILES"
+    FR_INVALID_PARAMETER:   int = "FR_INVALID_PARAMETER"
+
+// How a file is opened: `FA_READ` and `FA_WRITE`, with one of the rest.
+c const
+    FA_READ:          u8 = "FA_READ"
+    FA_WRITE:         u8 = "FA_WRITE"
+    FA_OPEN_EXISTING: u8 = "FA_OPEN_EXISTING"
+    FA_CREATE_NEW:    u8 = "FA_CREATE_NEW"
+    FA_CREATE_ALWAYS: u8 = "FA_CREATE_ALWAYS"
+    FA_OPEN_ALWAYS:   u8 = "FA_OPEN_ALWAYS"
+    FA_OPEN_APPEND:   u8 = "FA_OPEN_APPEND"
+
+// What `f_mkfs` writes.
+c const
+    FM_FAT:   u8 = "FM_FAT"
+    FM_FAT32: u8 = "FM_FAT32"
+    FM_ANY:   u8 = "FM_ANY"
+    FM_SFD:   u8 = "FM_SFD"
+
+// Which FAT a mounted volume is (`FATFS.fs_type`).
+c const
+    FS_FAT12: u8 = "FS_FAT12"
+    FS_FAT16: u8 = "FS_FAT16"
+    FS_FAT32: u8 = "FS_FAT32"
+
+// The attribute bits of a directory entry.
+c const
+    AM_RDO: u8 = "AM_RDO"
+    AM_HID: u8 = "AM_HID"
+    AM_SYS: u8 = "AM_SYS"
+    AM_DIR: u8 = "AM_DIR"
+    AM_ARC: u8 = "AM_ARC"
+
+// What the disk functions answer, and the status bits.
+c const
+    RES_OK:      int = "RES_OK"
+    RES_ERROR:   int = "RES_ERROR"
+    RES_WRPRT:   int = "RES_WRPRT"
+    RES_NOTRDY:  int = "RES_NOTRDY"
+    RES_PARERR:  int = "RES_PARERR"
+    STA_NOINIT:  u8 = "STA_NOINIT"
+    STA_NODISK:  u8 = "STA_NODISK"
+    STA_PROTECT: u8 = "STA_PROTECT"
+
+// The `disk_ioctl` commands FatFs sends with this configuration.
+c const
+    CTRL_SYNC:        u8 = "CTRL_SYNC"
+    GET_SECTOR_COUNT: u8 = "GET_SECTOR_COUNT"
+    GET_SECTOR_SIZE:  u8 = "GET_SECTOR_SIZE"
+    GET_BLOCK_SIZE:   u8 = "GET_BLOCK_SIZE"
+    CTRL_TRIM:        u8 = "CTRL_TRIM"
+
+// What `ffconf.h` chose, as the rest of the package needs it.
+c const
+    VOLUMES:  usize = "FF_VOLUMES"
+    MIN_SS:   u32 = "FF_MIN_SS"
+    MAX_SS:   u32 = "FF_MAX_SS"
+    MAX_LFN:  usize = "FF_MAX_LFN"
+    LFN_BUF:  usize = "FF_LFN_BUF"
+    SFN_BUF:  usize = "FF_SFN_BUF"
+    FS_LOCK:  usize = "FF_FS_LOCK"
+    USE_TRIM: int = "FF_USE_TRIM"
+
+// The integer widths the declarations below assume. `UINT` is C's `unsigned int`, and the sector
+// number and file size are 32 bits because this configuration has neither exFAT nor 64-bit LBA.
+c const
+    UINT_SIZE:    usize = "sizeof(UINT)"
+    LBA_SIZE:     usize = "sizeof(LBA_t)"
+    FSIZE_SIZE:   usize = "sizeof(FSIZE_t)"
+    DSTATUS_SIZE: usize = "sizeof(DSTATUS)"
+    TCHAR_SIZE:   usize = "sizeof(TCHAR)"
+
+@assert(UINT_SIZE == 4, "'UINT' is not 32 bits, which every declaration here assumes")
+@assert(LBA_SIZE == 4, "'LBA_t' is not 32 bits: exFAT or 64-bit LBA has been turned on in ffconf.h")
+@assert(FSIZE_SIZE == 4, "'FSIZE_t' is not 32 bits: exFAT has been turned on in ffconf.h")
+@assert(DSTATUS_SIZE == 1, "'DSTATUS' is not a byte")
+@assert(TCHAR_SIZE == 1, "'TCHAR' is not a byte: the API is not UTF-8 (FF_LFN_UNICODE 2)")
+
+// The three handles FatFs keeps the addresses of. Their layouts are FatFs's business, so sysl holds
+// each as words of the size the header says, and reads only the few fields `ff.h`'s own macros read
+// (`f_tell`, `f_size`), at the offsets the header gives.
+c const
+    FATFS_SIZE:  usize = "sizeof(FATFS)"
+    FATFS_ALIGN: usize = "_Alignof(FATFS)"
+    FIL_SIZE:    usize = "sizeof(FIL)"
+    FIL_ALIGN:   usize = "_Alignof(FIL)"
+    DIR_SIZE:    usize = "sizeof(DIR)"
+    DIR_ALIGN:   usize = "_Alignof(DIR)"
+
+c const
+    FATFS_FS_TYPE:  usize = "offsetof(FATFS, fs_type)"
+    FATFS_CSIZE:    usize = "offsetof(FATFS, csize)"
+    FATFS_SSIZE:    usize = "offsetof(FATFS, ssize)"
+    FATFS_N_FATENT: usize = "offsetof(FATFS, n_fatent)"
+    FIL_FPTR:       usize = "offsetof(FIL, fptr)"
+    FIL_OBJSIZE:    usize = "offsetof(FIL, obj.objsize)"
+    FIL_FS:         usize = "offsetof(FIL, obj.fs)"
+    DIR_FS:         usize = "offsetof(DIR, obj.fs)"
+
+@assert(FATFS_ALIGN <= 8, "'FATFS' wants a stronger alignment than an array of u64 gives")
+@assert(FIL_ALIGN <= 8, "'FIL' wants a stronger alignment than an array of u64 gives")
+@assert(DIR_ALIGN <= 8, "'DIR' wants a stronger alignment than an array of u64 gives")
+@assert(FATFS_CSIZE % 2 == 0, "'FATFS.csize' is not 2-aligned")
+@assert(FATFS_SSIZE % 2 == 0, "'FATFS.ssize' is not 2-aligned")
+@assert(FATFS_N_FATENT % 4 == 0, "'FATFS.n_fatent' is not 4-aligned")
+@assert(FIL_FPTR % 4 == 0, "'FIL.fptr' is not 4-aligned")
+@assert(FIL_OBJSIZE % 4 == 0, "'FIL.obj.objsize' is not 4-aligned")
+@assert(FIL_FS % 8 == 0, "'FIL.obj.fs' is not 8-aligned")
+@assert(DIR_FS % 8 == 0, "'DIR.obj.fs' is not 8-aligned")
+
+// Opaque stand-ins for the handles, so a pointer to one says which it is.
+struct Fatfs
+    private word: u64
+
+struct Fil
+    private word: u64
+
+struct Dir
+    private word: u64
+
+// `FILINFO`, field for field: one directory entry, or what `f_stat` found. The two names are UTF-8
+// and NUL-terminated.
+struct FilInfo
+    fsize: u32
+    fdate: u16
+    ftime: u16
+    fattrib: u8
+    altname: [35]u8
+    fname: [766]u8
+
+c const
+    FILINFO_SIZE:    usize = "sizeof(FILINFO)"
+    FILINFO_FDATE:   usize = "offsetof(FILINFO, fdate)"
+    FILINFO_FTIME:   usize = "offsetof(FILINFO, ftime)"
+    FILINFO_FATTRIB: usize = "offsetof(FILINFO, fattrib)"
+    FILINFO_ALTNAME: usize = "offsetof(FILINFO, altname)"
+    FILINFO_FNAME:   usize = "offsetof(FILINFO, fname)"
+
+// `MKFS_PARM`: how `f_mkfs` lays a volume out. A zero asks for FatFs's default.
+struct MkfsParm
+    fmt: u8
+    n_fat: u8
+    align: u32
+    n_root: u32
+    au_size: u32
+
+c const
+    MKFS_PARM_SIZE:    usize = "sizeof(MKFS_PARM)"
+    MKFS_PARM_ALIGN:   usize = "offsetof(MKFS_PARM, align)"
+    MKFS_PARM_N_ROOT:  usize = "offsetof(MKFS_PARM, n_root)"
+    MKFS_PARM_AU_SIZE: usize = "offsetof(MKFS_PARM, au_size)"
+
+// **Every layout sysl declares is checked against the header's when the package is compiled**, for
+// whichever target that is. A disagreement would link and then hand FatFs a structure with its fields
+// shifted, so it is refused here instead.
+@assert(sizeof(FilInfo) == FILINFO_SIZE, "sysl's FilInfo is not the size of 'FILINFO'")
+@assert(offsetof(FilInfo, fdate) == FILINFO_FDATE, "FilInfo.fdate is not where 'FILINFO' has it")
+@assert(offsetof(FilInfo, ftime) == FILINFO_FTIME, "FilInfo.ftime is not where 'FILINFO' has it")
+@assert(offsetof(FilInfo, fattrib) == FILINFO_FATTRIB, "FilInfo.fattrib is not where 'FILINFO' has it")
+@assert(offsetof(FilInfo, altname) == FILINFO_ALTNAME, "FilInfo.altname is not where 'FILINFO' has it")
+@assert(offsetof(FilInfo, fname) == FILINFO_FNAME, "FilInfo.fname is not where 'FILINFO' has it")
+@assert(SFN_BUF + 1 == 35, "FilInfo.altname is not FF_SFN_BUF + 1 bytes")
+@assert(LFN_BUF + 1 == 766, "FilInfo.fname is not FF_LFN_BUF + 1 bytes")
+@assert(sizeof(MkfsParm) == MKFS_PARM_SIZE, "sysl's MkfsParm is not the size of 'MKFS_PARM'")
+@assert(offsetof(MkfsParm, align) == MKFS_PARM_ALIGN, "MkfsParm.align is not where 'MKFS_PARM' has it")
+@assert(offsetof(MkfsParm, n_root) == MKFS_PARM_N_ROOT, "MkfsParm.n_root is not where 'MKFS_PARM' has it")
+@assert(offsetof(MkfsParm, au_size) == MKFS_PARM_AU_SIZE, "MkfsParm.au_size is not where 'MKFS_PARM' has it")
+
+// Volumes.
+extern "f_mount" f_mount(fs: *Fatfs, path: *u8, opt: u8) -> int
+extern "f_mkfs" f_mkfs(path: *u8, opt: *MkfsParm, work: *u8, len: u32) -> int
+extern "f_getfree" f_getfree(path: *u8, nclst: *u32, fatfs: **Fatfs) -> int
+extern "f_getlabel" f_getlabel(path: *u8, label: *u8, vsn: *u32) -> int
+extern "f_setlabel" f_setlabel(label: *u8) -> int
+
+// Entries by path.
+extern "f_stat" f_stat(path: *u8, fno: *FilInfo) -> int
+extern "f_unlink" f_unlink(path: *u8) -> int
+extern "f_rename" f_rename(path_old: *u8, path_new: *u8) -> int
+extern "f_mkdir" f_mkdir(path: *u8) -> int
+
+// Files.
+extern "f_open" f_open(fp: *Fil, path: *u8, mode: u8) -> int
+extern "f_close" f_close(fp: *Fil) -> int
+extern "f_read" f_read(fp: *Fil, buff: *u8, btr: u32, br: *u32) -> int
+extern "f_write" f_write(fp: *Fil, buff: *u8, btw: u32, bw: *u32) -> int
+extern "f_lseek" f_lseek(fp: *Fil, ofs: u32) -> int
+extern "f_truncate" f_truncate(fp: *Fil) -> int
+extern "f_sync" f_sync(fp: *Fil) -> int
+
+// Directories. `f_readdir` with a null `fno` rewinds.
+extern "f_opendir" f_opendir(dp: *Dir, path: *u8) -> int
+extern "f_closedir" f_closedir(dp: *Dir) -> int
+extern "f_readdir" f_readdir(dp: *Dir, fno: *FilInfo) -> int

@@ -1,0 +1,39 @@
+This package contains two things under two sets of terms.
+
+================================================================================
+sh/sysl/fatfs/c/ff.c, ff.h, diskio.h, ffunicode.c and ffconf.h — vendored,
+FatFs license (BSD-style, one clause)
+================================================================================
+
+The text below is FatFs's own, as it heads ff.c and ff.h, carried verbatim as
+redistribution requires. (ffconf.h is FatFs's configuration template with this
+package's settings; ffunicode.c carries the same text with the year 2022.)
+
+/----------------------------------------------------------------------------/
+/  FatFs - Generic FAT Filesystem Module  R0.16 w/patch 2                     /
+/-----------------------------------------------------------------------------/
+/
+/ Copyright (C) 2025, ChaN, all right reserved.
+/
+/ FatFs module is an open source software. Redistribution and use of FatFs in
+/ source and binary forms, with or without modification, are permitted provided
+/ that the following condition is met:
+/
+/ 1. Redistributions of source code must retain the above copyright notice,
+/    this condition and the following disclaimer.
+/
+/ This software is provided by the copyright holder and contributors "AS IS"
+/ and any warranties related to this software are DISCLAIMED.
+/ The copyright owner or contributors be NOT LIABLE for any damages caused
+/ by use of this software.
+/----------------------------------------------------------------------------/
+
+================================================================================
+Everything else here — ISC
+================================================================================
+
+Copyright 2026 Edward A. Maxedon, Sr.
+
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.

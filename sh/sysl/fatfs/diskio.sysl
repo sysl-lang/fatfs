@@ -1,0 +1,191 @@
+module sh.sysl.fatfs
+
+import sh.sysl.fatfs.c
+
+// FatFs's disk layer, written in sysl. FatFs calls five functions of fixed name for every sector it
+// reads or writes, and one for the time; an application normally writes them in C. Here they are
+// `@export`ed from sysl and route FatFs's drive number to the `BlockDevice` a `Volume` registered
+// for it, so a program supplies a device and never sees the C names.
+
+// Storage made of sectors of one size, which FatFs reads and writes whole.
+trait BlockDevice
+    // Bytes in a sector: 512, 1024, 2048 or 4096.
+    sector_size(*self) -> u32
+
+    // Sectors on the device.
+    sector_count(*self) -> u32
+
+    // Fill `out` from the sectors starting at `sector`. `out.len` is a whole number of sectors.
+    read(*self, sector: u32, out: []u8) -> Result[unit, DeviceError]
+
+    // Write `data` over the sectors starting at `sector`. `data.len` is a whole number of sectors.
+    write(*self, sector: u32, data: []const u8) -> Result[unit, DeviceError]
+
+    // Everything written before this is durable once it returns.
+    sync(*self) -> Result[unit, DeviceError]
+
+    // Sectors in the device's erase block, a power of two, which `format` aligns the data area to;
+    // 1 when it is unknown or does not matter.
+    erase_block(*self) -> u32 = 1
+
+    // Sectors `first` to `last` inclusive no longer hold anything, so flash may erase them.
+    trim(*self, first: u32, last: u32) -> Result[unit, DeviceError] = Ok(())
+
+    // Called before FatFs first touches the device, and again after a failure.
+    initialize(*self) -> Result[unit, DeviceError] = Ok(())
+
+    // Whether the device refuses writes.
+    write_protected(*self) -> bool = false
+
+// What a device answers when it cannot do what was asked. FatFs reports each of them from the
+// operation that met it: `Error.Disk`, `Error.WriteProtected` or `Error.NotReady`.
+enum DeviceError derives Display
+    Io
+    WriteProtected
+    NotReady
+
+// A date and time as FAT stores it: to two seconds, from 1980 to 2107.
+struct Timestamp derives Eq, Display
+    year: u16
+    month: u8
+    day: u8
+    hour: u8
+    minute: u8
+    second: u8
+
+// Where FatFs's timestamps come from: whatever answers the time on this machine.
+trait Clock
+    now(*self) -> Timestamp
+
+// The time stamped on every file written while no clock is set: the FAT epoch, 1980-01-01 00:00:00,
+// which is what a volume without a clock records.
+val NO_CLOCK: Timestamp = Timestamp(1980, 1, 1, 0, 0, 0)
+
+// Stamp what FatFs writes from now on with the time `clock` answers. The clock stays where it is
+// until `clear_clock`.
+set_clock(clock: *Clock)
+    time_source = Some(clock)
+
+// Stamp what FatFs writes from now on with `NO_CLOCK`.
+clear_clock()
+    time_source = None
+
+// One drive FatFs may name: the device a mounted or formatting `Volume` registered there, and
+// whether it has been initialized since.
+private struct Slot
+    device: Option[*BlockDevice]
+    ready: bool
+
+// Written as a constructor over literals so that it is laid into the image as data, which is the
+// only way module storage is set up on a machine that never runs initializers.
+private var slots: [c.VOLUMES]Slot = [Slot(None, false); c.VOLUMES]
+
+private var time_source: Option[*Clock] = None
+
+// Register `device` on `drive`. Refused if the drive does not exist or another device holds it.
+private[fatfs] claim(drive: u8, device: *BlockDevice) -> Result[unit, Error]
+    if usize(drive) >= c.VOLUMES then return Err(Error.InvalidDrive)
+    if slots[usize(drive)].device.is_some() then return Err(Error.DriveTaken)
+    slots[usize(drive)] = Slot(Some(device), false)
+    Ok(())
+
+private[fatfs] release(drive: u8)
+    if usize(drive) < c.VOLUMES then slots[usize(drive)] = Slot(None, false)
+
+// The device registered on `pdrv`, if any.
+private device_on(pdrv: u8) -> Option[*BlockDevice]
+    if usize(pdrv) >= c.VOLUMES then None else slots[usize(pdrv)].device
+
+private result(r: Result[unit, DeviceError]) -> int
+    r match
+        Ok(_) -> c.RES_OK
+        Err(DeviceError.Io) -> c.RES_ERROR
+        Err(DeviceError.WriteProtected) -> c.RES_WRPRT
+        Err(DeviceError.NotReady) -> c.RES_NOTRDY
+
+// The status bits FatFs asks for before every access.
+@export("disk_status")
+private disk_status(pdrv: u8) -> u8
+    device_on(pdrv) match
+        None -> c.STA_NOINIT | c.STA_NODISK
+        Some(dev) ->
+            val ready = if slots[usize(pdrv)].ready then 0u8 else c.STA_NOINIT
+            if dev.write_protected() then ready | c.STA_PROTECT else ready
+
+@export("disk_initialize")
+private disk_initialize(pdrv: u8) -> u8
+    device_on(pdrv) match
+        None -> c.STA_NOINIT | c.STA_NODISK
+        Some(dev) ->
+            slots[usize(pdrv)].ready = dev.initialize().is_ok()
+            disk_status(pdrv)
+
+// The bytes of `count` sectors from `sector`, if they lie on the device.
+private span(dev: *BlockDevice, sector: u32, count: u32) -> Option[usize]
+    if count == 0 || u64(sector) + u64(count) > u64(dev.sector_count()) then return None
+    Some(usize(count) * usize(dev.sector_size()))
+
+@export("disk_read")
+private disk_read(pdrv: u8, buff: *u8, sector: u32, count: u32) -> int
+    val dev = device_on(pdrv) match
+        None -> return c.RES_NOTRDY
+        Some(d) -> d
+    span(dev, sector, count) match
+        None -> c.RES_PARERR
+        Some(n) -> result(dev.read(sector, buff[0..<n]))
+
+@export("disk_write")
+private disk_write(pdrv: u8, buff: *u8, sector: u32, count: u32) -> int
+    val dev = device_on(pdrv) match
+        None -> return c.RES_NOTRDY
+        Some(d) -> d
+    if dev.write_protected() then return c.RES_WRPRT
+    span(dev, sector, count) match
+        None -> c.RES_PARERR
+        Some(n) -> result(dev.write(sector, buff[0..<n]))
+
+// The five commands this configuration of FatFs sends. Each writes its answer through `buff` in the
+// width `diskio.h` gives it: a sector count and an erase block are `LBA_t` and `DWORD` (32 bits), a
+// sector size is a `WORD`, and a trim reads two `LBA_t`s.
+@export("disk_ioctl")
+private disk_ioctl(pdrv: u8, cmd: u8, buff: *u8) -> int
+    val dev = device_on(pdrv) match
+        None -> return c.RES_NOTRDY
+        Some(d) -> d
+    if cmd == c.CTRL_SYNC then
+        result(dev.sync())
+    else if cmd == c.GET_SECTOR_COUNT then
+        val out: *u32 = ptr_cast(buff)
+        *out = dev.sector_count()
+        c.RES_OK
+    else if cmd == c.GET_SECTOR_SIZE then
+        val out: *u16 = ptr_cast(buff)
+        *out = u16(dev.sector_size())
+        c.RES_OK
+    else if cmd == c.GET_BLOCK_SIZE then
+        val out: *u32 = ptr_cast(buff)
+        *out = dev.erase_block()
+        c.RES_OK
+    else if cmd == c.CTRL_TRIM then
+        val range: *u32 = ptr_cast(buff)
+        result(dev.trim(range[0], range[1]))
+    else
+        c.RES_PARERR
+
+// The time FatFs stamps on what it writes, packed as FAT packs it.
+@export("get_fattime")
+private get_fattime() -> u32
+    val t = time_source match
+        None -> NO_CLOCK
+        Some(clock) -> clock.now()
+    pack_time(t)
+
+// `t` as a FAT date (high half) and time (low half).
+private[fatfs] pack_time(t: Timestamp) -> u32
+    (u32(t.year) - 1980) << 25 | u32(t.month) << 21 | u32(t.day) << 16 | u32(t.hour) << 11 |
+        u32(t.minute) << 5 | u32(t.second) / 2
+
+// A FAT date and time read back.
+private[fatfs] unpack_time(date: u16, time: u16) -> Timestamp
+    Timestamp(1980 + (date >> 9), u8(date >> 5 & 15), u8(date & 31), u8(time >> 11), u8(time >> 5 & 63),
+              u8((time & 31) * 2))

@@ -1,0 +1,691 @@
+module sh.sysl.fatfs
+@tests
+@requires(heap, os)
+
+import sh.sysl.fatfs.c
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_unchecked
+
+// The binding over a RAM device, and over devices that wrap it to fail, refuse writes, count what
+// FatFs asks of them, and report the wrong geometry.
+
+private const SECTOR: u32 = 512
+private const SECTORS: u32 = 4096
+
+// A FAT volume on `dev`, formatted with no partition table and mounted on `drive`.
+private fresh(dev: *BlockDevice, drive: u8 = 0, kind: FatKind = FatKind.Any) -> Volume
+    var vol = volume(drive, dev)
+    var work: [4096]u8 = [0; 4096]
+    vol.format(format_options(kind, partitioned = false), work[..]).unwrap()
+    vol.mount().unwrap()
+    vol
+
+private put(vol: *Volume, path: string, data: []const u8)
+    var f = file()
+    vol.open(&f, path, WRITE | CREATE_ALWAYS).unwrap()
+    f.write_all(data).unwrap()
+    f.close().unwrap()
+
+private get(vol: *Volume, path: string) -> Buf[u8]
+    var f = file()
+    vol.open(&f, path, READ).unwrap()
+    var out: Buf[u8] = buf()
+    for _ in 0..<usize(f.size())
+        out.push(0)
+    assert_eq(f.read(out.view()).unwrap(), out.len())
+    var extra: [1]u8 = [0]
+    assert_eq(f.read(extra[..]).unwrap(), 0)
+    f.close().unwrap()
+    out
+
+private text(vol: *Volume, path: string) -> string = from_utf8_unchecked(get(vol, path).view())
+
+// Byte `i` of a pattern no two nearby positions share, so a sector in the wrong place reads wrong.
+private pattern(n: usize, seed: usize = 0) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    for i in 0..<n
+        out.push(u8((i * 31 + i / 251 + seed * 7) % 256))
+    out
+
+private same(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+    for i in 0..<a.len
+        if a[i] != b[i] then return false
+    true
+
+// Every name in the directory at `path`, in the order FatFs lists them, as "name/" for a directory
+// and "name:size" for a file.
+private listing(vol: *Volume, path: string) -> string
+    var d = dir()
+    vol.open_dir(&d, path).unwrap()
+    var e = info()
+    var out = ""
+    while d.read(&e).unwrap()
+        val shown = if e.is_dir() then s"${e.name()}/" else s"${e.name()}:${e.size()}"
+        out = if out == "" then shown else s"${out} ${shown}"
+    d.close().unwrap()
+    out
+
+// The name `stat` finds at `path`, and its 8.3 name.
+private name_at(vol: *Volume, path: string) -> string
+    var e = vol.stat(path).unwrap()
+    from_utf8_unchecked(e.name().bytes)
+
+private short_name_at(vol: *Volume, path: string) -> string
+    var e = vol.stat(path).unwrap()
+    from_utf8_unchecked(e.short_name().bytes)
+
+private label_of(vol: *Volume) -> string
+    var l = vol.label().unwrap()
+    from_utf8_unchecked(l.name().bytes)
+
+private repeated(s: string, n: usize) -> string
+    var out = ""
+    for _ in 0..<n
+        out = s"${out}${s}"
+    out
+
+private err_of[T](r: Result[T, Error]) -> Error
+    r match
+        Ok(_) -> panic("expected an error")
+        Err(e) -> e
+
+// The RAM device behind a wrapper that can fail and that counts what it is asked.
+private struct Probe
+    ram: RamDevice
+    reported_size: u32
+    block: u32
+    fail_reads: bool
+    fail_writes: bool
+    protected: bool
+    init_fails: bool
+    reads: u32
+    writes: u32
+    syncs: u32
+    trims: u32
+    trimmed: u64
+
+private probe(sector: u32, sectors: u32) -> Probe = Probe(ram_device(sector, sectors), sector, 1, false, false, false, false, 0, 0, 0, 0, 0)
+
+impl BlockDevice for Probe
+    sector_size(*self) -> u32 = self.reported_size
+
+    sector_count(*self) -> u32 = self.ram.sector_count()
+
+    read(*self, sector: u32, out: []u8) -> Result[unit, DeviceError]
+        self.reads += 1
+        if self.fail_reads then return Err(DeviceError.Io)
+        self.ram.read(sector, out)
+
+    write(*self, sector: u32, data: []const u8) -> Result[unit, DeviceError]
+        self.writes += 1
+        if self.fail_writes then return Err(DeviceError.Io)
+        self.ram.write(sector, data)
+
+    sync(*self) -> Result[unit, DeviceError]
+        self.syncs += 1
+        Ok(())
+
+    override erase_block(*self) -> u32 = self.block
+
+    override trim(*self, first: u32, last: u32) -> Result[unit, DeviceError]
+        self.trims += 1
+        self.trimmed += u64(last - first + 1)
+        Ok(())
+
+    override initialize(*self) -> Result[unit, DeviceError] = if self.init_fails then Err(DeviceError.NotReady) else Ok(())
+
+    override write_protected(*self) -> bool = self.protected
+
+private struct FixedClock
+    at: Timestamp
+
+impl Clock for FixedClock
+    now(*self) -> Timestamp = self.at
+
+@test("the layouts sysl declares are the header's, and the handles fit their words")
+layouts()
+    assert_eq(sizeof(c.FilInfo), c.FILINFO_SIZE)
+    assert_eq(offsetof(c.FilInfo, fname), c.FILINFO_FNAME)
+    assert_eq(sizeof(c.MkfsParm), c.MKFS_PARM_SIZE)
+    assert(FATFS_WORDS * 8 >= c.FATFS_SIZE)
+    assert(FIL_WORDS * 8 >= c.FIL_SIZE)
+    assert(DIR_WORDS * 8 >= c.DIR_SIZE)
+    assert_eq(c.VOLUMES, 4)
+    assert_eq(c.MIN_SS, 512)
+    assert_eq(c.MAX_SS, 4096)
+    assert_eq(c.MAX_LFN, 255)
+    assert_eq(c.FS_LOCK, 8)
+    assert_eq(c.USE_TRIM, 1)
+
+@test("every FRESULT code maps to its own error, and an unknown one is kept")
+error_codes()
+    val codes: [20]int = [c.FR_OK, c.FR_DISK_ERR, c.FR_INT_ERR, c.FR_NOT_READY, c.FR_NO_FILE, c.FR_NO_PATH,
+                          c.FR_INVALID_NAME, c.FR_DENIED, c.FR_EXIST, c.FR_INVALID_OBJECT, c.FR_WRITE_PROTECTED,
+                          c.FR_INVALID_DRIVE, c.FR_NOT_ENABLED, c.FR_NO_FILESYSTEM, c.FR_MKFS_ABORTED,
+                          c.FR_TIMEOUT, c.FR_LOCKED, c.FR_NOT_ENOUGH_CORE, c.FR_TOO_MANY_OPEN_FILES,
+                          c.FR_INVALID_PARAMETER]
+    for i in 0..<codes.len
+        assert_eq(codes[i], int(i))
+    val want: [19]Error = [Error.Disk, Error.Internal, Error.NotReady, Error.NoFile, Error.NoPath,
+                           Error.InvalidName, Error.Denied, Error.Exists, Error.InvalidObject,
+                           Error.WriteProtected, Error.InvalidDrive, Error.NotEnabled, Error.NoFilesystem,
+                           Error.FormatAborted, Error.Timeout, Error.Locked, Error.NotEnoughCore,
+                           Error.TooManyOpenFiles, Error.InvalidParameter]
+    for i in 0..<want.len
+        assert_eq(error(codes[i + 1]), want[i])
+    assert_eq(error(20), Error.Unknown(20))
+    assert(check(c.FR_OK).is_ok())
+
+@test("a file written to a formatted volume reads back after a remount")
+round_trip()
+    var dev = ram_device(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    put(&vol, "hello.txt", "hello, card".bytes)
+    vol.unmount().unwrap()
+    assert(!vol.is_mounted())
+    vol.mount().unwrap()
+    assert_eq(text(&vol, "hello.txt"), "hello, card")
+    assert_eq(text(&vol, "/HELLO.TXT"), "hello, card")
+    assert_eq(vol.fat_type().unwrap(), FatType.Fat12)
+    assert_eq(vol.sector_size().unwrap(), 512)
+
+@test("a file of many clusters, written in odd pieces, reads back byte for byte")
+large_file()
+    var dev = probe(SECTOR, 8192)
+    var vol = fresh(&dev)
+    val data = pattern(1_500_001, 3)
+    var f = file()
+    vol.open(&f, "big.bin", WRITE | CREATE_NEW).unwrap()
+    var at = 0usize
+    while at < data.len()
+        val n = if data.len() - at < 7777 then data.len() - at else 7777
+        f.write_all(data.view()[at..<at + n]).unwrap()
+        at += n
+    assert_eq(f.size(), 1_500_001)
+    f.close().unwrap()
+    vol.unmount().unwrap()
+    vol.mount().unwrap()
+    assert(same(get(&vol, "big.bin").view(), data.view()))
+    assert(dev.writes > 100)
+
+@test("a volume on 4096-byte sectors, the largest this configuration takes, holds files")
+four_k_sectors()
+    var dev = probe(4096, 8400)
+    var vol = fresh(&dev)
+    assert_eq(vol.sector_size().unwrap(), 4096)
+    assert_eq(vol.fat_type().unwrap(), FatType.Fat16)
+    val data = pattern(100_000, 5)
+    put(&vol, "four k.bin", data.view())
+    vol.unmount().unwrap()
+    vol.mount().unwrap()
+    assert(same(get(&vol, "four k.bin").view(), data.view()))
+    val space = vol.free_space().unwrap()
+    assert_eq(space.cluster_bytes % 4096, 0)
+
+@test("FAT16 and FAT32 are what format writes when asked, and what mount finds")
+fat_types()
+    var a = ram_device(SECTOR, 40_000)
+    var v16 = fresh(&a, 0, FatKind.Fat)
+    assert_eq(v16.fat_type().unwrap(), FatType.Fat16)
+    var b = ram_device(SECTOR, 70_000)
+    var v32 = fresh(&b, 1, FatKind.Fat32)
+    assert_eq(v32.fat_type().unwrap(), FatType.Fat32)
+    put(&v32, "on fat32.txt", "thirty-two".bytes)
+    v32.unmount().unwrap()
+    v32.mount().unwrap()
+    assert_eq(text(&v32, "on fat32.txt"), "thirty-two")
+    v16.unmount().unwrap()
+    assert_eq(err_of(v16.fat_type()), Error.NotEnabled)
+
+@test("a volume formatted with a partition table, as an SD card is, mounts and holds files")
+partitioned()
+    var dev = ram_device(SECTOR, 8192)
+    var vol = volume(0, &dev)
+    var work: [4096]u8 = [0; 4096]
+    vol.format(format_options(), work[..]).unwrap()
+    val image = dev.image()
+    assert_eq(image[510], 0x55)
+    assert_eq(image[511], 0xaa)
+    assert(image[446 + 4] != 0)
+    vol.mount().unwrap()
+    put(&vol, "a", "partitioned".bytes)
+    assert_eq(text(&vol, "a"), "partitioned")
+
+@test("long names in any script round-trip, list as written, and get an 8.3 name beside them")
+long_names()
+    var dev = ram_device(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    val names: [6]string = ["Long name with spaces.txt", "naïve café.bin", "日本語のファイル名.dat",
+                            "Ελληνικά — μεγάλο αρχείο", "emoji 😀 past the BMP.txt", "MiXeD.Txt"]
+    for i in 0..<names.len
+        put(&vol, names[i], pattern(100 + i, i).view())
+    vol.unmount().unwrap()
+    vol.mount().unwrap()
+    for i in 0..<names.len
+        assert(same(get(&vol, names[i]).view(), pattern(100 + i, i).view()))
+        assert_eq(name_at(&vol, names[i]), names[i])
+    assert_eq(listing(&vol, "/"), "Long name with spaces.txt:100 naïve café.bin:101 日本語のファイル名.dat:102 Ελληνικά — μεγάλο αρχείο:103 emoji 😀 past the BMP.txt:104 MiXeD.Txt:105")
+    assert_eq(short_name_at(&vol, "Long name with spaces.txt"), "LONGNA~1.TXT")
+    // FatFs's `f_stat` answers the name as the path spelled it; a listing answers it as stored.
+    assert_eq(name_at(&vol, "mixed.txt"), "mixed.txt")
+    val longest = repeated("n", 255)
+    put(&vol, longest, "x".bytes)
+    assert_eq(name_at(&vol, longest), longest)
+    var f = file()
+    assert_eq(err_of(vol.open(&f, repeated("n", 256), WRITE | CREATE_NEW)), Error.InvalidName)
+
+@test("directories nest, list their entries, rewind, and refuse removal until empty")
+directories()
+    var dev = ram_device(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    vol.mkdir("docs").unwrap()
+    vol.mkdir("docs/deep").unwrap()
+    put(&vol, "docs/a.txt", "aaa".bytes)
+    put(&vol, "docs/deep/b.txt", "bb".bytes)
+    assert_eq(listing(&vol, "docs"), "deep/ a.txt:3")
+    assert_eq(listing(&vol, "/docs/deep"), "b.txt:2")
+    assert_eq(listing(&vol, ""), "docs/")
+    assert(vol.stat("docs").unwrap().is_dir())
+    assert_eq(vol.stat("docs").unwrap().attributes() & DIRECTORY, DIRECTORY)
+    var d = dir()
+    vol.open_dir(&d, "docs").unwrap()
+    var e = info()
+    assert(d.read(&e).unwrap())
+    assert(d.read(&e).unwrap())
+    assert(!d.read(&e).unwrap())
+    d.rewind().unwrap()
+    assert(d.read(&e).unwrap())
+    assert_eq(e.name(), "deep")
+    d.close().unwrap()
+    assert_eq(err_of(d.read(&e)), Error.InvalidObject)
+    assert_eq(err_of(vol.remove("docs")), Error.Denied)
+    assert_eq(err_of(vol.mkdir("docs")), Error.Exists)
+    vol.remove("docs/deep/b.txt").unwrap()
+    vol.remove("docs/deep").unwrap()
+    vol.remove("docs/a.txt").unwrap()
+    vol.remove("docs").unwrap()
+    assert(!vol.exists("docs").unwrap())
+    assert_eq(listing(&vol, "/"), "")
+    // Sixty long names run the directory over several clusters.
+    vol.mkdir("many").unwrap()
+    for k in 0..<60usize
+        put(&vol, s"many/file number ${k} with a long name.txt", s"${k}".bytes)
+    var count = 0
+    vol.open_dir(&d, "many").unwrap()
+    while d.read(&e).unwrap()
+        count += 1
+    d.close().unwrap()
+    assert_eq(count, 60)
+    assert_eq(text(&vol, "many/file number 59 with a long name.txt"), "59")
+
+@test("rename moves an entry across directories, and refuses a target that exists or a source that does not")
+renames()
+    var dev = ram_device(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    vol.mkdir("to").unwrap()
+    put(&vol, "a.txt", "moved".bytes)
+    put(&vol, "b.txt", "stays".bytes)
+    vol.rename("a.txt", "to/renamed with a long name.txt").unwrap()
+    assert(!vol.exists("a.txt").unwrap())
+    assert_eq(text(&vol, "to/renamed with a long name.txt"), "moved")
+    assert_eq(err_of(vol.rename("b.txt", "to/renamed with a long name.txt")), Error.Exists)
+    assert_eq(err_of(vol.rename("gone.txt", "c.txt")), Error.NoFile)
+    assert_eq(err_of(vol.rename("b.txt", "nowhere/c.txt")), Error.NoPath)
+    vol.rename("to", "moved dir").unwrap()
+    assert_eq(text(&vol, "moved dir/renamed with a long name.txt"), "moved")
+
+@test("seek, tell, size, truncate, append and sync do what FatFs documents")
+positions()
+    var dev = probe(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    put(&vol, "f", pattern(3000).view())
+    var f = file()
+    assert(!f.is_open())
+    vol.open(&f, "f", READ | WRITE).unwrap()
+    assert(f.is_open())
+    assert_eq(f.size(), 3000)
+    assert_eq(f.tell(), 0)
+    f.seek(1000).unwrap()
+    assert_eq(f.tell(), 1000)
+    f.write_all("PATCH".bytes).unwrap()
+    assert_eq(f.tell(), 1005)
+    f.seek(2000).unwrap()
+    f.truncate().unwrap()
+    assert_eq(f.size(), 2000)
+    assert(f.at_end())
+    // Past the end of a file opened for writing, the file grows to reach the position.
+    f.seek(5000).unwrap()
+    assert_eq(f.size(), 5000)
+    val syncs = dev.syncs
+    f.sync().unwrap()
+    assert(dev.syncs > syncs)
+    f.close().unwrap()
+    assert(!f.is_open())
+    val back = get(&vol, "f")
+    assert_eq(back.len(), 5000)
+    assert(same(back.view()[1000..<1005], "PATCH".bytes))
+    assert(same(back.view()[0..<1000], pattern(1000).view()))
+    // Opened only for reading, a seek past the end stops at the end.
+    vol.open(&f, "f", READ).unwrap()
+    f.seek(9000).unwrap()
+    assert_eq(f.tell(), 5000)
+    f.close().unwrap()
+    vol.open(&f, "f", WRITE | OPEN_APPEND).unwrap()
+    assert_eq(f.tell(), 5000)
+    f.write_all("end".bytes).unwrap()
+    f.close().unwrap()
+    assert_eq(vol.stat("f").unwrap().size(), 5003)
+    vol.open(&f, "new", WRITE | OPEN_ALWAYS).unwrap()
+    f.close().unwrap()
+    assert_eq(vol.stat("new").unwrap().size(), 0)
+    put(&vol, "f", "short".bytes)
+    assert_eq(text(&vol, "f"), "short")
+
+@test("the errors FatFs answers for a missing file, a missing directory, a bad name and an existing file")
+path_errors()
+    var dev = ram_device(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    var f = file()
+    assert_eq(err_of(vol.open(&f, "missing.txt", READ)), Error.NoFile)
+    assert_eq(err_of(vol.open(&f, "no/such/dir.txt", READ)), Error.NoPath)
+    assert_eq(err_of(vol.stat("missing.txt")), Error.NoFile)
+    assert_eq(err_of(vol.remove("missing.txt")), Error.NoFile)
+    assert_eq(err_of(vol.open(&f, "bad*name", WRITE | CREATE_NEW)), Error.InvalidName)
+    assert_eq(err_of(vol.open(&f, "what?", WRITE | CREATE_NEW)), Error.InvalidName)
+    assert_eq(err_of(vol.mkdir("a|b")), Error.InvalidName)
+    assert_eq(err_of(vol.open(&f, "1:elsewhere", WRITE | CREATE_NEW)), Error.InvalidName)
+    assert_eq(err_of(vol.open(&f, "nul\0inside", WRITE | CREATE_NEW)), Error.InvalidName)
+    assert_eq(err_of(vol.open(&f, repeated("p", MAX_PATH + 1), READ)), Error.PathTooLong)
+    put(&vol, "here.txt", "x".bytes)
+    assert_eq(err_of(vol.open(&f, "here.txt", WRITE | CREATE_NEW)), Error.Exists)
+    assert_eq(err_of(vol.mkdir("here.txt")), Error.Exists)
+    assert(!vol.exists("missing.txt").unwrap())
+    assert(vol.exists("here.txt").unwrap())
+    assert_eq(err_of(vol.exists("no/such/x")), Error.NoPath)
+
+@test("a file opened for reading refuses writes, and one opened for writing refuses reads")
+access_errors()
+    var dev = ram_device(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    put(&vol, "r.txt", "read me".bytes)
+    var f = file()
+    vol.open(&f, "r.txt", READ).unwrap()
+    assert_eq(err_of(f.write("no".bytes)), Error.Denied)
+    assert_eq(err_of(f.truncate()), Error.Denied)
+    f.close().unwrap()
+    vol.open(&f, "r.txt", WRITE).unwrap()
+    var out: [4]u8 = [0; 4]
+    assert_eq(err_of(f.read(out[..])), Error.Denied)
+    f.close().unwrap()
+    assert_eq(err_of(f.read(out[..])), Error.InvalidObject)
+    assert_eq(err_of(f.close()), Error.InvalidObject)
+    var never = file()
+    assert_eq(err_of(never.write("x".bytes)), Error.InvalidObject)
+
+@test("FatFs's file lock refuses a second writer, removing an open file, and a ninth open file")
+locks()
+    var dev = ram_device(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    put(&vol, "shared", "s".bytes)
+    var a = file()
+    var b = file()
+    vol.open(&a, "shared", READ).unwrap()
+    vol.open(&b, "shared", READ).unwrap()
+    b.close().unwrap()
+    assert_eq(err_of(vol.open(&b, "shared", WRITE)), Error.Locked)
+    assert_eq(err_of(vol.remove("shared")), Error.Locked)
+    assert_eq(err_of(vol.rename("shared", "other")), Error.Locked)
+    a.close().unwrap()
+    var files: Buf[File] = buf()
+    for _ in 0..<9
+        files.push(file())
+    val all = files.view()
+    for i in 0..<9usize
+        put(&vol, s"f${i}", "x".bytes)
+    for i in 0..<8usize
+        vol.open(&all[i], s"f${i}", READ).unwrap()
+    assert_eq(err_of(vol.open(&all[8], "f8", READ)), Error.TooManyOpenFiles)
+    for i in 0..<8usize
+        all[i].close().unwrap()
+    vol.open(&all[8], "f8", READ).unwrap()
+    all[8].close().unwrap()
+
+@test("a full volume stops a write short, and write_all says so")
+full_volume()
+    var dev = ram_device(SECTOR, 256)
+    var vol = fresh(&dev)
+    val space = vol.free_space().unwrap()
+    var f = file()
+    vol.open(&f, "fill", WRITE | CREATE_NEW).unwrap()
+    val data = pattern(usize(space.free_bytes()) + 4096)
+    val n = f.write(data.view()).unwrap()
+    assert_eq(u64(n), space.free_bytes())
+    assert_eq(err_of(f.write_all("more".bytes)), Error.Full)
+    f.close().unwrap()
+    assert_eq(vol.free_space().unwrap().free_clusters, 0)
+    assert_eq(err_of(vol.mkdir("no room")), Error.Denied)
+    vol.remove("fill").unwrap()
+    assert_eq(vol.free_space().unwrap().free_clusters, space.free_clusters)
+
+@test("free space falls by the clusters a file takes and the totals match the volume")
+free_space()
+    var dev = ram_device(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    val before = vol.free_space().unwrap()
+    assert(before.total_clusters > 2000)
+    assert_eq(before.free_clusters, before.total_clusters)
+    assert_eq(before.total_bytes(), u64(before.total_clusters) * u64(before.cluster_bytes))
+    put(&vol, "x", pattern(usize(before.cluster_bytes) * 3 + 1).view())
+    assert_eq(vol.free_space().unwrap().free_clusters, before.free_clusters - 4)
+
+@test("a label is set, read back with the serial, removed, and refused when it is not a FAT name")
+labels()
+    var dev = ram_device(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    assert_eq(label_of(&vol), "")
+    vol.set_label("SYSL DISK").unwrap()
+    var l = vol.label().unwrap()
+    assert_eq(l.name(), "SYSL DISK")
+    assert(l.serial != 0)
+    vol.set_label("lower").unwrap()
+    assert_eq(label_of(&vol), "LOWER")
+    assert_eq(err_of(vol.set_label("TWELVE CHARS")), Error.InvalidName)
+    assert_eq(err_of(vol.set_label("A*B")), Error.InvalidName)
+    vol.set_label("").unwrap()
+    assert_eq(label_of(&vol), "")
+
+@test("what FatFs writes is stamped with the clock's time, or with 1980-01-01 when there is none")
+timestamps()
+    var dev = ram_device(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    var clock = FixedClock(Timestamp(2026, 10, 14, 21, 37, 59))
+    set_clock(&clock)
+    put(&vol, "stamped", "t".bytes)
+    vol.mkdir("dir").unwrap()
+    assert_eq(vol.stat("stamped").unwrap().modified(), Timestamp(2026, 10, 14, 21, 37, 58))
+    assert_eq(vol.stat("dir").unwrap().modified(), Timestamp(2026, 10, 14, 21, 37, 58))
+    clock.at = Timestamp(2107, 12, 31, 23, 59, 58)
+    put(&vol, "late", "t".bytes)
+    assert_eq(vol.stat("late").unwrap().modified(), Timestamp(2107, 12, 31, 23, 59, 58))
+    clear_clock()
+    put(&vol, "unstamped", "t".bytes)
+    assert_eq(vol.stat("unstamped").unwrap().modified(), Timestamp(1980, 1, 1, 0, 0, 0))
+    assert_eq(pack_time(Timestamp(1980, 1, 1, 0, 0, 0)), 0x0021_0000)
+    assert_eq(unpack_time(0x5d4e, 0xacbd), Timestamp(2026, 10, 14, 21, 37, 58))
+
+@test("volumes on several drives at once are independent, and a drive is held by one volume")
+several_volumes()
+    var a = ram_device(SECTOR, SECTORS)
+    var b = ram_device(SECTOR, SECTORS * 2)
+    var d = ram_device(SECTOR, SECTORS)
+    var va = fresh(&a, 0)
+    var vb = fresh(&b, 1)
+    var vd = fresh(&d, 3)
+    put(&va, "which", "a".bytes)
+    put(&vb, "which", "b".bytes)
+    put(&vd, "which", "d".bytes)
+    assert_eq(text(&va, "which"), "a")
+    assert_eq(text(&vb, "which"), "b")
+    assert_eq(text(&vd, "which"), "d")
+    assert(vb.free_space().unwrap().total_clusters > va.free_space().unwrap().total_clusters)
+    var again = volume(1, &d)
+    assert_eq(err_of(again.mount()), Error.DriveTaken)
+    var work: [4096]u8 = [0; 4096]
+    assert_eq(err_of(again.format(format_options(), work[..])), Error.DriveTaken)
+    vb.unmount().unwrap()
+    assert_eq(err_of(vb.unmount()), Error.NotEnabled)
+    var vb2 = volume(1, &b)
+    vb2.mount().unwrap()
+    assert_eq(text(&vb2, "which"), "b")
+    var none = volume(u8(VOLUMES), &a)
+    assert_eq(err_of(none.mount()), Error.InvalidDrive)
+
+@test("an unmounted volume refuses every operation, and a mount of a blank device finds no filesystem")
+unmounted()
+    var dev = ram_device(SECTOR, SECTORS)
+    var vol = volume(0, &dev)
+    var f = file()
+    var d = dir()
+    assert_eq(err_of(vol.open(&f, "x", READ)), Error.NotEnabled)
+    assert_eq(err_of(vol.open_dir(&d, "")), Error.NotEnabled)
+    assert_eq(err_of(vol.stat("x")), Error.NotEnabled)
+    assert_eq(err_of(vol.mkdir("x")), Error.NotEnabled)
+    assert_eq(err_of(vol.free_space()), Error.NotEnabled)
+    assert_eq(err_of(vol.label()), Error.NotEnabled)
+    assert_eq(err_of(vol.unmount()), Error.NotEnabled)
+    assert_eq(err_of(vol.mount()), Error.NoFilesystem)
+    assert(!vol.is_mounted())
+    // The failed mount let the drive go.
+    var work: [4096]u8 = [0; 4096]
+    vol.format(format_options(partitioned = false), work[..]).unwrap()
+    vol.mount().unwrap()
+    assert_eq(err_of(vol.mount()), Error.Denied)
+    assert_eq(err_of(vol.format(format_options(), work[..])), Error.Denied)
+    // A file left open across an unmount is no longer valid.
+    put(&vol, "x", "x".bytes)
+    vol.open(&f, "x", READ).unwrap()
+    vol.unmount().unwrap()
+    var out: [1]u8 = [0]
+    assert_eq(err_of(f.read(out[..])), Error.InvalidObject)
+    // FatFs's own answer for a drive with no volume registered.
+    var raw: [3]u8 = [u8('2'), u8(':'), 0]
+    var fno = info()
+    assert_eq(error(c.f_stat(&raw[0], &fno.raw)), Error.NotEnabled)
+
+@test("a device that fails its reads or writes is a disk error, and one that cannot start is not ready")
+device_errors()
+    var dev = probe(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    put(&vol, "a", pattern(2000).view())
+    vol.unmount().unwrap()
+    dev.fail_reads = true
+    assert_eq(err_of(vol.mount()), Error.Disk)
+    dev.fail_reads = false
+    vol.mount().unwrap()
+    dev.fail_writes = true
+    var f = file()
+    assert_eq(err_of(vol.mkdir("d")), Error.Disk)
+    dev.fail_writes = false
+    vol.unmount().unwrap()
+    vol.mount().unwrap()
+    vol.open(&f, "a", READ).unwrap()
+    dev.fail_reads = true
+    var out: [600]u8 = [0; 600]
+    assert_eq(err_of(f.read(out[..])), Error.Disk)
+    dev.fail_reads = false
+    f.close().unwrap()
+    vol.unmount().unwrap()
+    dev.init_fails = true
+    assert_eq(err_of(vol.mount()), Error.NotReady)
+    var work: [4096]u8 = [0; 4096]
+    assert_eq(err_of(vol.format(format_options(), work[..])), Error.NotReady)
+    dev.init_fails = false
+    vol.mount().unwrap()
+    assert(same(get(&vol, "a").view(), pattern(2000).view()))
+
+@test("a write-protected device mounts for reading and refuses every write")
+write_protected()
+    var dev = probe(SECTOR, SECTORS)
+    var vol = fresh(&dev)
+    put(&vol, "a", "kept".bytes)
+    vol.unmount().unwrap()
+    dev.protected = true
+    vol.mount().unwrap()
+    assert_eq(text(&vol, "a"), "kept")
+    var f = file()
+    assert_eq(err_of(vol.open(&f, "b", WRITE | CREATE_NEW)), Error.WriteProtected)
+    assert_eq(err_of(vol.mkdir("d")), Error.WriteProtected)
+    assert_eq(err_of(vol.remove("a")), Error.WriteProtected)
+    vol.unmount().unwrap()
+    var work: [4096]u8 = [0; 4096]
+    assert_eq(err_of(vol.format(format_options(), work[..])), Error.WriteProtected)
+
+@test("format refuses a work area under FF_MAX_SS, a device too small for FAT, and a sector size FatFs cannot take")
+format_errors()
+    var dev = probe(SECTOR, SECTORS)
+    var vol = volume(0, &dev)
+    // FatFs itself takes one 512-byte sector here, then clears 4096 bytes of it for the partition
+    // table, which AddressSanitizer reports as an overflow of the caller's buffer.
+    var small: [4095]u8 = [0; 4095]
+    assert_eq(WORK_MIN, 4096)
+    assert_eq(err_of(vol.format(format_options(), small[..])), Error.NotEnoughCore)
+    assert_eq(err_of(vol.format(format_options(), small[0..<512])), Error.NotEnoughCore)
+    assert_eq(dev.writes, 0)
+    var raw_parm = c.MkfsParm(c.FM_ANY, 0, 0, 0, 0)
+    var drive: [3]u8 = [u8('0'), u8(':'), 0]
+    claim(0, &dev).unwrap()
+    assert_eq(error(c.f_mkfs(&drive[0], &raw_parm, &small[0], 0)), Error.NotEnoughCore)
+    release(0)
+    var tiny = ram_device(SECTOR, 40)
+    var tv = volume(1, &tiny)
+    var work: [4096]u8 = [0; 4096]
+    assert_eq(err_of(tv.format(format_options(partitioned = false), work[..])), Error.FormatAborted)
+    var few = ram_device(SECTOR, 20_000)
+    var fv = volume(2, &few)
+    assert_eq(err_of(fv.format(format_options(FatKind.Fat32, partitioned = false), work[..])), Error.FormatAborted)
+    dev.reported_size = 8192
+    assert_eq(err_of(vol.format(format_options(), work[..])), Error.Disk)
+    dev.reported_size = 256
+    assert_eq(err_of(vol.format(format_options(), work[..])), Error.Disk)
+
+@test("format takes the device's erase block and trims the whole volume; removing a file trims its clusters")
+erase_and_trim()
+    var dev = probe(SECTOR, SECTORS)
+    dev.block = 64
+    var vol = volume(0, &dev)
+    var work: [4096]u8 = [0; 4096]
+    vol.format(format_options(FatKind.Fat, partitioned = false, fats = 2), work[..]).unwrap()
+    assert(dev.trims > 0)
+    assert_eq(dev.trimmed, u64(SECTORS))
+    val image = dev.ram.image()
+    val reserved = u32(image[14]) | u32(image[15]) << 8
+    val fats = u32(image[16])
+    val roots = u32(image[17]) | u32(image[18]) << 8
+    val fat_size = u32(image[22]) | u32(image[23]) << 8
+    assert_eq(fats, 2)
+    assert_eq((reserved + fats * fat_size + roots * 32 / 512) % 64, 0)
+    vol.mount().unwrap()
+    put(&vol, "gone", pattern(10_000).view())
+    val trims = dev.trims
+    vol.remove("gone").unwrap()
+    assert(dev.trims > trims)
+
+@test("options reach the boot sector: two FATs, a cluster size, a root directory size")
+format_parameters()
+    var dev = ram_device(SECTOR, 20_000)
+    var vol = volume(0, &dev)
+    var work: [4096]u8 = [0; 4096]
+    vol.format(format_options(FatKind.Fat, partitioned = false, fats = 2, root_entries = 128, cluster_bytes = 2048), work[..]).unwrap()
+    val image = dev.image()
+    assert_eq(u32(image[11]) | u32(image[12]) << 8, 512)
+    assert_eq(image[13], 4)
+    assert_eq(image[16], 2)
+    assert_eq(u32(image[17]) | u32(image[18]) << 8, 128)
+    // The volume covers the whole device, as many sectors as it reported.
+    val total16 = u32(image[19]) | u32(image[20]) << 8
+    val total32 = u32(image[32]) | u32(image[33]) << 8 | u32(image[34]) << 16 | u32(image[35]) << 24
+    assert_eq(if total16 != 0 then total16 else total32, 20_000)
+    vol.mount().unwrap()
+    assert_eq(vol.free_space().unwrap().cluster_bytes, 2048)
+    assert_eq(vol.fat_type().unwrap(), FatType.Fat16)
