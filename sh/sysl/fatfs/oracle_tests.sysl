@@ -2,7 +2,7 @@ module sh.sysl.fatfs
 @tests
 @requires(heap, os)
 
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf, buf_filled}
 import sysl.fs.{exists, make_temp_dir, read_bytes, remove_dir_all, write_bytes}
 import sysl.process.{Var, capture}
 import sysl.testing.skip
@@ -201,9 +201,7 @@ private reads_what_mtools_wrote(fat_bits: string, kib: string, want: FatType)
         for at in ["", "docs/deep/"]
             vol.open(&f, f"$at${s.name}", READ).unwrap()
             assert_eq(usize(f.size()), s.size)
-            var got: Buf[u8] = buf()
-            for _ in 0..<s.size
-                got.push(0)
+            var got = buf_filled(s.size, u8(0))
             assert_eq(f.read(got.view()).unwrap(), s.size)
             f.close().unwrap()
             assert(bytes_equal(got.view(), content(s.size, s.seed).view()), f"$at${s.name}")

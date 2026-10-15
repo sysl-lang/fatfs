@@ -3,7 +3,7 @@ module sh.sysl.fatfs
 @requires(heap, os)
 
 import sh.sysl.fatfs.c
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf, buf_filled}
 import sysl.text.from_utf8_unchecked
 
 // The binding over a RAM device, and over devices that wrap it to fail, refuse writes, count what
@@ -29,9 +29,7 @@ private put(vol: *Volume, path: string, data: []const u8)
 private get(vol: *Volume, path: string) -> Buf[u8]
     var f = file()
     vol.open(&f, path, READ).unwrap()
-    var out: Buf[u8] = buf()
-    for _ in 0..<usize(f.size())
-        out.push(0)
+    var out = buf_filled(usize(f.size()), u8(0))
     assert_eq(f.read(out.view()).unwrap(), out.len())
     var extra: [1]u8 = [0]
     assert_eq(f.read(extra[..]).unwrap(), 0)
