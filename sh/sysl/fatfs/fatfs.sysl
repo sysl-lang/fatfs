@@ -185,6 +185,7 @@ struct Label
     name(*self) -> string = terminated_view(self.bytes[..])
 
 // An open file. It is opened by `Volume.open` and keeps a pointer to its volume.
+@pinned
 struct File
     private state: [FIL_WORDS]u64
 
@@ -246,6 +247,7 @@ struct File
 file() -> File = File([0; FIL_WORDS])
 
 // An open directory, read one entry at a time.
+@pinned
 struct Dir
     private state: [DIR_WORDS]u64
 
@@ -266,6 +268,7 @@ dir() -> Dir = Dir([0; DIR_WORDS])
 
 // A FAT volume on drive `drive` (0 to `VOLUMES - 1`) of the device it was made with. Paths name
 // entries on this volume, from its root: `"docs/a.txt"` or `"/docs/a.txt"`.
+@pinned
 struct Volume
     private state: [FATFS_WORDS]u64
     private path: [PATH_ROOM]u8
@@ -314,7 +317,7 @@ struct Volume
         release(self.drive)
         r
 
-    is_mounted(self) -> bool = self.mounted
+    is_mounted(*self) -> bool = self.mounted
 
     // Which FAT the mounted volume is.
     fat_type(*self) -> Result[FatType, Error]
@@ -428,8 +431,8 @@ struct Volume
         on_drive(self.drive, path, self.second_path[..])
 end Volume
 
-// A volume on drive `drive` of `device`, not yet formatted or mounted. It may be moved until it is
-// mounted.
+// A volume on drive `drive` of `device`, not yet formatted or mounted. It is `@pinned`: built where it
+// lives, never copied.
 volume(drive: u8, device: *BlockDevice) -> Volume
     Volume([0; FATFS_WORDS], [0; PATH_ROOM], [0; PATH_ROOM], device, drive, false)
 

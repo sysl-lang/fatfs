@@ -52,7 +52,8 @@ a NUL-terminated copy, at most `MAX_PATH` (511) bytes.
 **A mounted `Volume`, an open `File` and an open `Dir` must stay where they are**, because FatFs keeps
 their addresses: `f_mount` registers the volume by address, and every open file and directory points
 at its volume. On a board they are module storage; a copy taken after `mount` or `open` is one FatFs
-knows nothing about. (sysl's coming `@pinned` will refuse such a copy: see finding 3 below.)
+knows nothing about. `Volume`, `File` and `Dir` are `@pinned`, so sysl refuses such a copy at compile time:
+`var copy = vol` is an error, and `volume()`, `file()` and `dir()` build their value in the caller's slot.
 
 An `Info`'s names are views of its own storage, so listing a directory allocates nothing; copy a name
 to keep it past the next `Dir.read`. FatFs's `f_stat` answers the name as the path spelled it
@@ -119,7 +120,7 @@ leaves the boot sector's copy as formatted. fsck.fat reports the difference (a t
 The package needs no operating system and no allocator, and the drive table is laid into the image as
 data. But `ff.c` includes `<string.h>` and calls `memset`, `memcpy`, `memcmp` and `strchr`, and today a
 sysl package has no way to hand its C `sysl-lang/cstd`'s headers. Two sysl changes accepted for
-alpha.14 close that (findings 1 and 2 below); until then `sysl build-lib . --target thumb-freestanding`
+alpha.14 close that (findings 1 and 2 below); this package does not take them up yet, so `sysl build-lib . --target thumb-freestanding`
 stops at `ff.c:22:10: fatal error: 'string.h' file not found`. A target with a C library (the Pico
 SDK's newlib, Zephyr, FreeRTOS) has the headers already.
 
@@ -197,7 +198,8 @@ are in `LICENSE`.
 
 ## What binding FatFs found in sysl
 
-In full in `FINDINGS.md`. Found against sysl 0.1.0-alpha.12; none is worked around. All three are the gaps
+In full in `FINDINGS.md`. Found against sysl 0.1.0-alpha.12; none is worked around. Finding 3 is fixed in sysl 0.1.x and taken up here;
+findings 1 and 2 are open (checked against sysl 0.1.1). All three are the gaps
 [`sysl-lang/littlefs`](https://github.com/sysl-lang/littlefs) found first (its FINDINGS 1–3), met
 again here. Binding FatFs found no new one: the `@export`ed disk layer, a table of
 `Option[*BlockDevice]` trait objects as folded module storage, `*u32` and `*u16` writes through
@@ -219,6 +221,6 @@ FatFs's `void *` ioctl buffer, and `c const` layouts and offsets all worked as t
    library and must not be where there is one. Accepted for alpha.14 (sysl branch `target-deps`).
 3. **Nothing stops a struct being copied after C has taken its address.** `f_mount` stores the
    `FATFS`'s address and every `FIL` and `DIR` points at its `FATFS`, yet `var copy = vol` after
-   `vol.mount()` compiles. The tests move a `Volume` only before it is mounted. Accepted for alpha.14
-   as `@pinned` (sysl branch `pinned`): `Volume`, `File` and `Dir` take it then, and `volume()`,
-   `file()` and `dir()` keep their shape, since a fresh pinned value is built in the caller's slot.
+   `vol.mount()` compiled. Fixed in sysl 0.1.x; workaround removed: `Volume`, `File` and `Dir` are
+   `@pinned`, and `volume()`, `file()` and `dir()` keep their shape, since a fresh pinned value is built
+   in the caller's slot.
