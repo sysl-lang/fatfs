@@ -4,7 +4,7 @@
 // This is the block a consumer writes to reach it:
 //
 //     dependencies {
-//       fatfs { git = "github.com/sysl-lang/fatfs", version = "0.1.0" }
+//       fatfs { git = "github.com/sysl-lang/fatfs", version = "0.1.1" }
 //     }
 //
 // The module is `sh.sysl.fatfs`.
@@ -15,5 +15,9 @@
 
 package {
   name    = "fatfs"
-  version = "0.1.0"
+  version = "0.1.1"
+}
+
+dependencies {
+  cstd { git = "github.com/sysl-lang/cstd", version = "0.1.0", if = "!libc" }
 }

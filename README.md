@@ -118,15 +118,17 @@ leaves the boot sector's copy as formatted. fsck.fat reports the difference (a t
 ## Bare metal
 
 The package needs no operating system and no allocator, and the drive table is laid into the image as
-data. But `ff.c` includes `<string.h>` and calls `memset`, `memcpy`, `memcmp` and `strchr`, and today a
-sysl package has no way to hand its C `sysl-lang/cstd`'s headers. Two sysl changes accepted for
-alpha.14 close that (findings 1 and 2 below); this package does not take them up yet, so `sysl build-lib . --target thumb-freestanding`
-stops at `ff.c:22:10: fatal error: 'string.h' file not found`. A target with a C library (the Pico
-SDK's newlib, Zephyr, FreeRTOS) has the headers already.
+data. `ff.c` includes `<string.h>` and calls `memset`, `memcpy`, `memcmp` and `strchr`, so on a board the
+package takes [`sysl-lang/cstd`](https://github.com/sysl-lang/cstd) as its C library
+(`cstd { ..., if = "!libc" }` in `package.hocon`): the C is compiled against cstd's headers and the
+archive carries cstd's definitions. Where the target has a C library (the host, the Pico SDK's newlib,
+Zephyr, FreeRTOS) the dependency is dropped and that library answers. The suite builds the package with
+`build-c` for `thumbv7em-freestanding` and `riscv32-freestanding` and checks with `nm` that the archive
+defines FatFs's entry points and cstd's libc functions. It needs sysl 0.1.2 or later.
 
 ## Tests
 
-`sysl test .` runs 30 tests. Beyond every operation, over a RAM device and over one that fails,
+`sysl test .` runs 33 tests. Beyond every operation, over a RAM device and over one that fails,
 refuses writes and counts what it is asked:
 
 - **Every error that can be provoked**, each from the case that causes it: a missing file and a
@@ -169,7 +171,7 @@ never reaching the device; write protection left out of the status; a failed ini
 reported ready; a path handed over without its drive number (four, the several-volumes test among
 them).
 
-**AddressSanitizer**: `SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .` passes 30/30. The test
+**AddressSanitizer**: `SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .` passes 33/33. The test
 binary imports ten `__asan_report_*` hooks and `__asan_memcpy`, and FatFs's own C is instrumented: the
 run is what caught `f_mkfs` clearing 4096 bytes of a 512-byte work area, reported inside
 `create_partition`.
@@ -198,8 +200,7 @@ are in `LICENSE`.
 
 ## What binding FatFs found in sysl
 
-In full in `FINDINGS.md`. Found against sysl 0.1.0-alpha.12; none is worked around. Finding 3 is fixed in sysl 0.1.x and taken up here;
-findings 1 and 2 are open (checked against sysl 0.1.1). All three are the gaps
+In full in `FINDINGS.md`. Found against sysl 0.1.0-alpha.12; none is worked around. All three are fixed in sysl 0.1.x and taken up here. All three were the gaps
 [`sysl-lang/littlefs`](https://github.com/sysl-lang/littlefs) found first (its FINDINGS 1–3), met
 again here. Binding FatFs found no new one: the `@export`ed disk layer, a table of
 `Option[*BlockDevice]` trait objects as folded module storage, `*u32` and `*u16` writes through
@@ -216,9 +217,9 @@ FatFs's `void *` ioctl buffer, and `c const` layouts and offsets all worked as t
    ```
 
    (`c.sysl`'s `c const` block does compile there: `ff.h` needs only `<stdint.h>`, which clang
-   supplies freestanding.) Accepted for alpha.14 (sysl branch `vendored-c`).
+   supplies freestanding.) Fixed in sysl 0.1.x (vendored C compiled against a dependency's headers); taken up in 0.1.1.
 2. **A dependency cannot be taken on some targets only**: cstd must be linked where there is no C
-   library and must not be where there is one. Accepted for alpha.14 (sysl branch `target-deps`).
+   library and must not be where there is one. Fixed in sysl 0.1.0 (`if = "!libc"`); taken up in 0.1.1.
 3. **Nothing stops a struct being copied after C has taken its address.** `f_mount` stores the
    `FATFS`'s address and every `FIL` and `DIR` points at its `FATFS`, yet `var copy = vol` after
    `vol.mount()` compiled. Fixed in sysl 0.1.x; workaround removed: `Volume`, `File` and `Dir` are

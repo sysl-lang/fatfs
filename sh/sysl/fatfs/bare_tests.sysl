@@ -1,0 +1,59 @@
+module sh.sysl.fatfs
+
+@tests
+
+// FatFs on a board. `ff.c` includes `<string.h>`, and a freestanding target has no C library, so the
+// package takes cstd with `if = "!libc"`: on a bare-metal target the vendored C is compiled against
+// cstd's `include/` and the archive carries cstd's definitions of what FatFs calls; on the host the
+// dependency is dropped and the real libc answers.
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.make_dir_all
+import sysl.process.capture
+import sysl.testing.compiler
+import sysl.text.{Search, split}
+
+// FatFs's own entry points, and the `@export`ed disk layer it calls back into.
+private val own:[]string = ["f_mount", "f_open", "f_mkfs", "disk_read", "disk_write"]
+
+// The libc functions `ff.c` calls.
+private val called:[]string = ["memcpy", "memset", "memcmp", "strchr", "strlen"]
+
+// The global symbols the archive `build-c` writes for this package defines, one name per line.
+private defines(target: string) -> string
+    val dir = f".sysl/bare-tests/$target"
+    make_dir_all(dir).unwrap()
+    val lib = f"$dir/libfatfs.a"
+    var args: Buf[string] = buf()
+    for a in ["build-c", ".", "-o", lib] do args.push(a)
+    if target != "host"
+        args.push("--target")
+        args.push(target)
+    val built = capture(compiler(), args.view(), stderr = true).unwrap()
+    if !built.status.ok() then panic(f"build-c of fatfs for $target failed:\n${built.err.unwrap_or("")}")
+    val listed = capture("nm", ["-g", lib]).unwrap()
+    assert(listed.status.ok())
+    var defined = "\n"
+    for line in split(listed.text, "\n")
+        val t = line.index_of(" T ")
+        if t.is_some() then defined += f"${line[t.unwrap() + 3..<line.len]}\n"
+    defined
+
+private bare_case(target: string)
+    val defined = defines(target)
+    for n in own
+        if !defined.contains(f"\n$n\n") then panic(f"$target: the archive does not define $n")
+    for n in called
+        if !defined.contains(f"\n$n\n") then panic(f"$target: the archive does not define $n, so cstd was not FatFs's libc")
+
+@test("on thumbv7em FatFs is compiled against cstd's headers and the archive defines what it calls")
+bare_thumbv7em() = bare_case("thumbv7em-freestanding")
+
+@test("on riscv32 FatFs is compiled against cstd's headers and the archive defines what it calls")
+bare_riscv32() = bare_case("riscv32-freestanding")
+
+@test("on the host the dependency is dropped and the archive defines none of the libc")
+bare_host()
+    val defined = defines("host")
+    for n in called
+        if defined.contains(f"\n$n\n") then panic(f"the host archive defines $n, which belongs to the real libc")
