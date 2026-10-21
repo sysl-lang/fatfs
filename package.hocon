@@ -19,5 +19,5 @@ package {
 }
 
 dependencies {
-  cstd { git = "github.com/sysl-lang/cstd", version = "0.1.0", if = "!libc" }
+  cstd { git = "github.com/sysl-lang/cstd", version = "0.1.4", if = "!libc" }
 }
