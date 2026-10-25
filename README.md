@@ -120,7 +120,7 @@ leaves the boot sector's copy as formatted. fsck.fat reports the difference (a t
 The package needs no operating system and no allocator, and the drive table is laid into the image as
 data. `ff.c` includes `<string.h>` and calls `memset`, `memcpy`, `memcmp` and `strchr`, so on a board the
 package takes [`sysl-lang/cstd`](https://github.com/sysl-lang/cstd) as its C library
-(`cstd { ..., if = "!libc" }` in `package.hocon`): the C is compiled against cstd's headers and the
+(`cstd { ..., if = "!libc" }` in `sysl.hocon`): the C is compiled against cstd's headers and the
 archive carries cstd's definitions. Where the target has a C library (the host, the Pico SDK's newlib,
 Zephyr, FreeRTOS) the dependency is dropped and that library answers. The suite builds the package with
 `build-c` for `thumbv7em-freestanding` and `riscv32-freestanding` and checks with `nm` that the archive

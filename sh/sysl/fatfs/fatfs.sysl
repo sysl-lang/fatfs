@@ -1,6 +1,7 @@
 module sh.sysl.fatfs
 
 import sh.sysl.fatfs.c
+import sysl.raw.ptr_cast
 import sysl.slices.{as_mut_ptr, as_ptr}
 import sysl.text.str_view
 

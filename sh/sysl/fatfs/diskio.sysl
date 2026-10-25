@@ -1,6 +1,7 @@
 module sh.sysl.fatfs
 
 import sh.sysl.fatfs.c
+import sysl.raw.ptr_cast
 
 // FatFs's disk layer, written in sysl. FatFs calls five functions of fixed name for every sector it
 // reads or writes, and one for the time; an application normally writes them in C. Here they are
